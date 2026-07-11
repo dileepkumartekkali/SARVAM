@@ -41,12 +41,20 @@ export class MicCapture {
    * Call `new AudioContext()` directly in your onClick handler and pass it here.
    */
   async start(preCreatedContext) {
+    // `{ideal: true}`, not a bare `true`. A bare boolean is a HARD constraint
+    // — reported live: on certain mic/driver stacks (confirmed across two
+    // completely different devices/OSes, ruling out one bad mic), Chrome
+    // couldn't actually satisfy all three simultaneously and, instead of
+    // throwing, silently handed back a track present in name but delivering
+    // literal all-zero samples (exact 0.0000 RMS — real ambient noise almost
+    // never rounds to exactly zero, which was the tell). `ideal` lets the
+    // browser do its best without ever degrading to a dead track.
     this._stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         channelCount: 1,
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
+        echoCancellation: { ideal: true },
+        noiseSuppression: { ideal: true },
+        autoGainControl: { ideal: true },
       },
     });
     // Which physical device the browser actually picked — when a mic
