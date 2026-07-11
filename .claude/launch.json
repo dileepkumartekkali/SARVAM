@@ -1,0 +1,23 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "frontend",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "frontend", "run", "dev"],
+      "port": 3000
+    },
+    {
+      "name": "backend",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["backend/scripts/run_dev_server.py"],
+      "port": 9000
+    },
+    {
+      "name": "speech-gateway",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["backend/scripts/run_dev_gateway.py"],
+      "port": 9100
+    }
+  ]
+}

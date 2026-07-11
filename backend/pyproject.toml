@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "maav-backend"
+version = "0.1.0"
+description = "MAAV / Vaani multilingual voice agent — backend (FastAPI, async, LangGraph + Sarvam)"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "websockets>=12.0",
+    "pydantic>=2.6",
+    "langgraph>=0.2.0",
+    "redis>=5.0",              # redis.asyncio — async client, no thread-per-connection
+    # Prod checkpointer backend. Optional at runtime: MemorySaver fallback is used
+    # when no DSN is configured, so local dev / CI / smoke test need no database.
+    "langgraph-checkpoint-postgres>=2.0",
+    # HTTP client for all LLM provider adapters (Grok/GPT/Sarvam share an
+    # OpenAI-compatible schema; Claude/Gemini have their own). One client
+    # instead of five vendor SDKs.
+    "httpx>=0.27",
+    # JWT verification. Not hand-rolled: signature verification is exactly
+    # the kind of security-critical primitive ponytail's "never simplify
+    # away security measures" rule exists for — use the audited library.
+    "pyjwt>=2.8",
+    # Observability (Phase 8): standard tools, not hand-rolled protocols.
+    # opentelemetry-sdk's ConsoleSpanExporter works with zero collector infra
+    # (real spans, real output) — swap in an OTLP exporter for a real backend
+    # (Jaeger/Tempo) without touching instrumentation call sites.
+    "opentelemetry-sdk>=1.24",
+    "prometheus-client>=0.20",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["agent_core"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

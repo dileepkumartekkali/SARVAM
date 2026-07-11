@@ -1,0 +1,200 @@
+================================================================================
+MAAV / VAANI — END-TO-END VOICE PIPELINE EXPLANATION
+TTS (Text-to-Speech), STT (Speech-to-Text), STS (Speech-to-Speech)
+================================================================================
+
+THE THREE SERVICES
+------------------
+  frontend        React app (port 5173)  — UI, microphone capture, audio playback
+  backend         FastAPI  (port 8000)   — the agent: LLM reasoning, tools, memory
+  speech-gateway  FastAPI  (port 8100)   — the ONLY process that talks to Sarvam
+                                           speech APIs; holds the speech API keys
+
+Why a separate gateway: the browser must never see Sarvam API keys, and the
+backend (LLM keys) is kept separate from the speech keys. Each service holds
+only its own secrets.
+
+
+================================================================================
+1. TTS — TEXT TO SPEECH ("Text to Speech" mode in the UI)
+================================================================================
+User types text; the reply is shown AND spoken aloud.
+
+STEP-BY-STEP:
+ 1. User types a message and presses send.
+      frontend/src/components/Composer.jsx       — input box + mode tabs
+      frontend/src/App.jsx                        — handleSend -> the voice hook
+ 2. The message goes to the backend as HTTP POST /chat with
+    mode="text_to_speech".
+      frontend/src/hooks/useVoiceSession.js       — sendMessage()
+      frontend/src/api/chatClient.js              — sendChatMessage(); also the
+                                                    word-by-word reveal animation
+ 3. Backend runs the agent turn (see "THE AGENT" below) and returns the
+    reply text + detected language.
+ 4. Frontend opens ONE WebSocket to the gateway: ws://localhost:8100/ws/tts,
+    sends {language, model:"bulbul:v3"}, then the reply text, then "__END__".
+      frontend/src/hooks/useVoiceSession.js       — speakReply()
+      frontend/src/api/voiceSocket.js             — connectTTS()/sendText()
+ 5. Gateway chunks the text into sentence-sized pieces and streams them to
+    Sarvam's TTS WebSocket (model bulbul:v3), one Sarvam socket per utterance.
+      backend/agent_core/speech_gateway/main.py   — /ws/tts route
+      backend/agent_core/speech/chunker.py        — sentence chunking
+      backend/agent_core/speech/sarvam_tts.py     — real Sarvam TTS protocol
+                                                    (nested `data` objects,
+                                                    flush-per-chunk, base64 MP3
+                                                    audio back)
+      backend/agent_core/speech/tts_provider_policy.py — routes Assamese/Urdu
+                                                    to the Azure fallback voice
+      backend/agent_core/speech/fallback_tts.py   — that Azure fallback
+ 6. Audio chunks (MP3) stream back to the browser. They are decoded and
+    played STRICTLY ONE AT A TIME through a queue — this is what prevents
+    two chunks playing on top of each other ("second voice" bug, fixed).
+      frontend/src/api/ttsPlayback.js             — TTSPlayer queue + decode
+ 7. The gateway closes its Sarvam socket when the utterance is done. If the
+    browser vanishes without a clean close, a 10s idle timeout ends the
+    connection (leak fix).
+
+LANGUAGE RULE FOR TTS: voice replies are always written in the language's
+NATIVE script (e.g. Telugu Unicode, never romanized "Telugulish") because the
+TTS voice maps pronunciation from native script — romanized text gets
+garbled/skipped words. Enforced by a deterministic self-check + one
+correction retry in the agent (backend/agent_core/agents/task_agent.py).
+
+
+================================================================================
+2. STT — SPEECH TO TEXT ("Speech to Text" mode in the UI)
+================================================================================
+User speaks; transcript becomes the message; the reply is shown as TEXT only.
+
+STEP-BY-STEP:
+ 1. User taps the mic orb.
+      frontend/src/components/VoiceOrb.jsx        — the orb + state label
+      frontend/src/hooks/useVoiceSession.js       — startListening()
+ 2. Microphone capture starts: browser mic -> 48kHz float audio ->
+    resampled locally to 16kHz PCM16 -> 32ms frames (1024 bytes each).
+      frontend/src/api/micCapture.js              — capture + resampling
+ 3. LOCAL VOICE GATE (production rule): every frame's loudness (RMS) is
+    measured IN THE BROWSER, against an ADAPTIVE threshold calibrated to
+    this session's own noise floor (fixed thresholds failed on real mics).
+    Until real voice is detected:
+      - frames only fill a small local pre-roll buffer (~0.5s),
+      - NO WebSocket is opened, NOTHING is sent to Sarvam/LLM/anything.
+    * If no voice within 3 SECONDS of tapping -> mic stops, back to idle,
+      zero API usage, no chat turn, silence costs nothing.
+    * The moment voice IS detected -> the STT socket opens, the pre-roll
+      (so the first word isn't clipped) plus live frames stream out.
+      frontend/src/hooks/useVoiceSession.js       — voice gate, timers
+      frontend/public/mic-worklet.js              — AudioWorklet capture
+                                                    (audio-thread processing)
+ 4. Gateway validates each frame (size/rate sanity — malformed audio never
+    reaches Sarvam) and relays to Sarvam's STT WebSocket (model saaras:v3,
+    codemix mode: handles all 13 languages + mixed language speech).
+      backend/agent_core/speech_gateway/main.py   — /ws/stt route
+      backend/agent_core/speech/audio_validation.py — frame validation
+      backend/agent_core/speech/sarvam_stt.py     — real Sarvam STT protocol
+                                                    (config via URL params,
+                                                    base64-JSON audio, VAD
+                                                    events translated to a
+                                                    stable internal shape)
+ 5. Sarvam sends back one final transcript PER SPEECH SEGMENT (a pause
+    splits segments). Segments ACCUMULATE — a brief mid-sentence pause does
+    NOT end the question; everything said is joined into one message.
+ 6. THE ONE STOP RULE (production rule): 3 SECONDS of continuous silence
+    ends listening. Every voiced frame resets the timer. When it fires, the
+    accumulated transcript is finalized (the socket waits up to 2s more if
+    the last segment is still in flight, so nothing said is dropped). If
+    voice was heard but no transcript came, a visible "I didn't catch that"
+    message appears — never a silent failure.
+ 7. MANUAL CONTROL: tapping the orb while listening stops everything
+    immediately — mic, socket, timers — and nothing is sent.
+ 8. The full spoken question is shown as the user's chat message and sent
+    to POST /chat with mode="speech_to_text". The reply comes back as TEXT
+    ONLY — no TTS call is made in this mode.
+
+LANGUAGE RULE FOR STT MODE: the reply mirrors how the user spoke — romanized
+"Telugulish/Hinglish" input gets a romanized reply; native-script input gets
+native script. Same self-check + correction mechanism.
+
+FAILURE HANDLING (all VISIBLE in chat, never silent):
+  - mic permission denied            -> explains how to enable it
+  - no working microphone            -> names the device error
+  - Sarvam STT stream drops          -> gateway retries with backoff, then
+                                        falls back to REST transcription on
+                                        the buffered audio
+      backend/agent_core/speech_gateway/failure_policy.py — retry/fallback rules
+
+
+================================================================================
+3. STS — SPEECH TO SPEECH ("Speech to Speech" mode in the UI)
+================================================================================
+User speaks; the reply is shown AND spoken aloud. This is STT + the agent +
+TTS glued together, and shares all the code paths above:
+
+ 1-7. Identical to STT steps 1-7 (same startListening, same voice gate, same
+      2s/4s rules, same auto-stop on speech_end, same manual toggle).
+ 8.   The transcript goes to POST /chat with mode="speech_to_speech".
+      In this mode the backend applies the VOICE system prompt (short spoken
+      answers, no markdown, native script) and the write-scope confirmation
+      gate (irreversible actions like delete_note require explicit
+      confirmation — a safety rule for voice, where a misheard word must not
+      delete data).
+        prompts/voice_mode_system.v1.txt          — the voice prompt rules
+        backend/agent_core/security/confirmation.py — the confirmation gate
+ 9.   The reply text is then spoken via the same TTS path as section 1
+      (speakReply -> /ws/tts -> Sarvam -> queued playback).
+ 10.  The mic is NOT listening during playback (deliberate: saves metered
+      STT streaming time; a server-side full-duplex endpoint /ws/converse
+      with barge-in exists if that tradeoff should flip later).
+
+Note: a server-side full-duplex variant of this loop also exists at
+ws://gateway/ws/converse (STT -> chat -> TTS in one socket, with barge-in
+support via backend/agent_core/speech_gateway/duplex_session.py and
+backend_client.py), currently not used by the UI.
+
+
+================================================================================
+THE AGENT (what happens inside POST /chat, all three modes)
+================================================================================
+  backend/agent_core/api/main.py                — /chat endpoint, auth, CORS
+  backend/agent_core/security/auth.py           — JWT verification (RBAC)
+  backend/agent_core/supervisor/graph.py        — LangGraph: language detection
+                                                  -> task agent; per-thread
+                                                  CONVERSATION MEMORY lives in
+                                                  the graph checkpointer (the
+                                                  agent remembers prior turns)
+  backend/agent_core/agents/language_agent.py   — detects which of 13 languages
+                                                  (script analysis first — free;
+                                                  LLM classify only as fallback)
+  backend/agent_core/agents/task_agent.py       — the reasoning loop: native
+                                                  tool-calling, tool budget,
+                                                  language/script directives,
+                                                  self-check + correction retry
+  backend/agent_core/tools/builtin.py           — the real tools (calculate,
+                                                  datetime, unit convert, notes)
+  backend/agent_core/llm_adapter/config.py      — LLM provider order:
+                                                  gemini -> sarvam -> grok ->
+                                                  claude -> gpt, automatic
+                                                  fallback on failure
+  backend/agent_core/llm_adapter/providers/*    — one adapter per provider API
+  prompts/*.txt                                 — system prompts (text + voice)
+
+Observability: every stage emits OpenTelemetry spans + Prometheus metrics
+  backend/agent_core/observability/             — tracing, metrics, logging
+
+
+================================================================================
+PRODUCTION TIMING RULES (summary of the guarantees)
+================================================================================
+  T+0s      user taps mic. Frames stay LOCAL. Nothing sent anywhere.
+  T+3s      no voice detected  -> mic off, idle. Zero API usage, no message.
+  voice!    STT socket opens NOW; pre-roll + live audio stream to Sarvam.
+  speaking  every voiced frame resets the ONE 3s silence timer. Brief pauses
+            (< 3s) do NOT end the question — transcript segments accumulate.
+  3s quiet  turn concludes: everything said is joined into one visible user
+            message and sent to the agent (socket waits up to 2s extra for
+            an in-flight final transcript so nothing is dropped).
+  any time  tapping the orb stops mic + socket + timers instantly.
+  server    dead/vanished clients: gateway closes STT/TTS connections after
+            10s idle; Sarvam-side sockets are closed within 5s of audio end
+            (no leaked metered connections).
+================================================================================

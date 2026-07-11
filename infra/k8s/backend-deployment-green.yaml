@@ -1,0 +1,100 @@
+# Backend: blue-green rollout. Blue-green (not canary) is the right fit here
+# because the backend is stateless per-request (SessionState/graph state
+# lives in the checkpointer, not in-process) — an instant traffic cutover is
+# safe. Contrast with the Speech Gateway (speech-gateway-rollout.yaml), whose
+# long-lived WebSocket connections make an instant cutover destructive.
+#
+# `blue` is the currently-live deployment (infra/k8s/backend-deployment.yaml,
+# labeled track=blue); this file is `green`, the new version. deploy.yml
+# applies this, waits for readiness, smoke-tests it, then patches the
+# Service selector from track=blue to track=green.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: maav-backend-green
+  labels:
+    app: maav-backend
+    track: green
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: maav-backend
+      track: green
+  template:
+    metadata:
+      labels:
+        app: maav-backend
+        track: green
+    spec:
+      containers:
+        - name: backend
+          image: maav-backend:latest # CI replaces with the built SHA tag
+          ports:
+            - containerPort: 8000
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: 1
+              memory: 512Mi
+          env:
+            - name: REDIS_URL
+              value: redis://redis:6379/0
+            - name: POSTGRES_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: maav-backend-secrets
+                  key: postgres-dsn
+            - name: JWT_SIGNING_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: maav-backend-secrets
+                  key: jwt-signing-secret
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 20
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: maav-backend-green
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: maav-backend-green
+  minReplicas: 2
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          # Per the load-test report (docs/LOAD_TEST_REPORT.md): backend CPU,
+          # not connection count, is the observed constraint for this
+          # service — scale on CPU.
+          averageUtilization: 65
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: maav-backend
+spec:
+  selector:
+    app: maav-backend
+    track: blue # deploy.yml flips this to `green` after the smoke test passes
+  ports:
+    - port: 80
+      targetPort: 8000

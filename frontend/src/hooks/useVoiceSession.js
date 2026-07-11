@@ -1,0 +1,374 @@
+import { useCallback, useRef } from "react";
+import { sendChatMessage, revealProgressively } from "../api/chatClient";
+import { MicCapture } from "../api/micCapture";
+import { TTSPlayer } from "../api/ttsPlayback";
+import { VoiceSocketClient } from "../api/voiceSocket";
+import { ConnectionState, Mode, VoiceState, useAppStore } from "../store/useAppStore";
+
+// THE one stop rule: 3 seconds of continuous silence ends listening —
+// whether the user never spoke at all, or spoke and then went quiet. Every
+// voiced frame resets this timer. Deliberately NOT stopping on Sarvam's
+// per-segment `speech_end` anymore: that fires on brief mid-sentence pauses
+// too, and cutting there ends the question early. Instead, transcript
+// segments ACCUMULATE across pauses and everything said gets joined into
+// one question when the 3s of real silence finally lands.
+const SILENCE_STOP_MS = 3000;
+
+// After the 3s silence stop, the LAST speech segment's transcript may still
+// be in flight from Sarvam (it follows speech_end by up to ~1-2s). The
+// socket stays open this much longer to catch it — so what the user said is
+// never silently dropped.
+const FINAL_TRANSCRIPT_GRACE_MS = 2000;
+
+// Local energy gate deciding "is this frame voice?" — ADAPTIVE, bounded on
+// BOTH ends. Two real failures shaped this: (1) a fixed threshold missed a
+// quiet mic entirely (no socket ever opened); (2) an absolute "anything
+// above 0.02 is voice" fast path meant a noisy room / autoGainControl-
+// amplified ambient hum counted EVERY frame as voice, so the 3s silence
+// timer reset forever and the turn never concluded — "no response, no
+// errors". The threshold now derives only from the session's own measured
+// noise floor, clamped into [MIN_VOICE_RMS .. NOISE_FLOOR_CAP x MULTIPLIER]
+// = [0.006 .. 0.04]: quiet rooms detect soft speech, noisy rooms don't
+// treat their own hum as speech, and speech through autoGainControl
+// (0.05-0.3 typical) clears 0.04 comfortably.
+const MIN_VOICE_RMS = 0.006; // below this it's noise on ANY mic, never voice
+const NOISE_FLOOR_CAP = 0.01; // floor estimate never exceeds this (speaking-from-frame-1 can't inflate it)
+const NOISE_FLOOR_MULTIPLIER = 4; // voiced = this many times the (capped) measured floor
+const CONSECUTIVE_VOICED_FRAMES_TO_OPEN = 2; // ~64ms — debounces clicks/pops
+
+// Listening can never run unbounded: even if a noisy environment keeps
+// resetting the silence timer, the session concludes here — whatever was
+// transcribed gets finalized and sent rather than hanging forever.
+const MAX_LISTEN_MS = 30000;
+
+// How often the live level line is printed while listening (console.info —
+// console.debug is HIDDEN by Chrome's default log level, which made the
+// previous detection log invisible exactly when it was needed in the field).
+const LEVEL_LOG_INTERVAL_MS = 2000;
+
+// ~0.5s of frames kept locally BEFORE voice is detected, flushed to Sarvam
+// once it is — so the start of the first word isn't clipped by the gate.
+const PRE_ROLL_MAX_FRAMES = 16;
+
+function frameRMS(arrayBuffer) {
+  const view = new DataView(arrayBuffer);
+  const sampleCount = arrayBuffer.byteLength / 2;
+  if (sampleCount === 0) return 0;
+  let sumSquares = 0;
+  for (let i = 0; i < sampleCount; i++) {
+    const s = view.getInt16(i * 2, true) / 0x8000;
+    sumSquares += s * s;
+  }
+  return Math.sqrt(sumSquares / sampleCount);
+}
+
+/**
+ * Deliberately NOT a persistent full-duplex session: the STT socket opens
+ * only while actively listening for one utterance and closes the instant a
+ * final transcript (or an error) arrives; the TTS socket opens only to speak
+ * one reply and closes right after. No socket is ever left open idle. This
+ * costs one barge-in-while-speaking capability (the mic isn't listening
+ * during TTS playback) in exchange for using measurably less of Sarvam's
+ * metered STT/TTS streaming time — the explicit tradeoff asked for. Full
+ * duplex + barge-in already exists server-side (speech_gateway's
+ * `/ws/converse`) if that tradeoff ever needs to flip.
+ */
+export function useVoiceSession({ token, ids, onUnauthorized }) {
+  const micRef = useRef(null);
+  const sttSocketRef = useRef(null);
+  const ttsPlayerRef = useRef(null);
+  const silenceTimerRef = useRef(null);
+  const graceTimerRef = useRef(null);
+  const maxListenTimerRef = useRef(null);
+
+  const mode = useAppStore((s) => s.mode);
+  const setVoiceState = useAppStore((s) => s.setVoiceState);
+  const setConnectionState = useAppStore((s) => s.setConnectionState);
+  const addMessage = useAppStore((s) => s.addMessage);
+  const appendToMessage = useAppStore((s) => s.appendToMessage);
+  const finishMessage = useAppStore((s) => s.finishMessage);
+  const setLanguageInfo = useAppStore((s) => s.setLanguageInfo);
+
+  const stopListening = useCallback(() => {
+    clearTimeout(silenceTimerRef.current);
+    clearTimeout(graceTimerRef.current);
+    clearTimeout(maxListenTimerRef.current);
+    micRef.current?.stop();
+    micRef.current = null;
+    sttSocketRef.current?.closeSTT();
+    sttSocketRef.current = null;
+  }, []);
+
+  const speakReply = useCallback(async (text, language) => {
+    setVoiceState(VoiceState.SPEAKING);
+    const player = (ttsPlayerRef.current ??= new TTSPlayer());
+    await new Promise((resolve) => {
+      const socket = new VoiceSocketClient({
+        onAudioChunk: (chunk) => {
+          player.playChunk(chunk).catch(() => {}); // one bad chunk shouldn't abort the whole reply
+        },
+        onEvent: (event) => {
+          // Previously dropped silently — a TTS failure looked identical to
+          // a normal "finished speaking" close, with no indication why no
+          // audio ever played.
+          if (event.type === "error" || event.type === "text_only_fallback") {
+            addMessage("assistant", event.message || `Voice reply unavailable: ${event.reason || "unknown error"}`);
+          }
+        },
+      });
+      // "unknown" is a real value `response_language` can carry (low-confidence
+      // detection) — not a valid Sarvam language code. Sending it straight
+      // through as-is made synthesis fail outright ("I'm having trouble with
+      // audio right now"), even though the text itself (e.g. the English
+      // clarifying question) was perfectly speakable in English.
+      const ttsLanguage = language && language !== "unknown" ? language : "en";
+      const ws = socket.connectTTS({ language: ttsLanguage, model: "bulbul:v3" });
+      ws.addEventListener("open", () => {
+        socket.sendText(text);
+        socket.endTTSUtterance();
+      });
+      ws.addEventListener("close", resolve); // /ws/tts closes once the utterance is fully synthesized
+      ws.addEventListener("error", resolve);
+    });
+    setVoiceState(VoiceState.IDLE);
+  }, [setVoiceState]);
+
+  const sendMessage = useCallback(
+    async (text) => {
+      const assistantId = addMessage("assistant", "", { streaming: true });
+      try {
+        const result = await sendChatMessage({
+          message: text,
+          mode,
+          sessionId: ids.current.sessionId,
+          conversationId: ids.current.conversationId,
+          threadId: ids.current.threadId,
+          token,
+        });
+        setLanguageInfo({
+          responseLanguage: result.response_language,
+          languageConfidence: result.language_confidence,
+          isCodeMixed: result.is_code_mixed,
+        });
+        await revealProgressively(result.response, (chunk) => appendToMessage(assistantId, chunk));
+        finishMessage(assistantId);
+
+        if (mode === Mode.SPEECH_TO_SPEECH || mode === Mode.TEXT_TO_SPEECH) {
+          await speakReply(result.response, result.response_language);
+        } else {
+          setVoiceState(VoiceState.IDLE);
+        }
+      } catch (err) {
+        if (err.status === 401) {
+          onUnauthorized?.();
+          return;
+        }
+        appendToMessage(assistantId, "Sorry, something went wrong reaching the assistant.");
+        finishMessage(assistantId);
+        setVoiceState(VoiceState.IDLE);
+      }
+    },
+    [mode, token, ids, onUnauthorized, addMessage, appendToMessage, finishMessage, setLanguageInfo, setVoiceState, speakReply]
+  );
+
+  const send = useCallback(
+    (text) => {
+      addMessage("user", text);
+      return sendMessage(text);
+    },
+    [addMessage, sendMessage]
+  );
+
+  const startListening = useCallback(async () => {
+    if (sttSocketRef.current || micRef.current) return; // already listening — never overlap two sessions
+    setVoiceState(VoiceState.LISTENING);
+
+    // Local voice gate: mic frames stay in the browser until voice is
+    // actually detected. The STT socket isn't even OPENED before that — so
+    // if the user taps the mic and says nothing, zero frames leave the
+    // machine and zero Sarvam/LLM/TTS usage happens. `preRoll` keeps the
+    // last ~0.5s of pre-voice audio so the first word isn't clipped.
+    let voiceDetected = false;
+    let socketOpen = false;
+    let socket = null;
+    let concluded = false;
+    const preRoll = [];
+    // Sarvam sends one final transcript PER SPEECH SEGMENT (a mid-sentence
+    // pause splits segments). They accumulate here and are joined into the
+    // ONE question shown and sent when 3s of real silence concludes the turn
+    // — so pausing to think doesn't cut the question short.
+    const transcriptSegments = [];
+
+    const stopIdle = () => {
+      stopListening();
+      setVoiceState(VoiceState.IDLE);
+    };
+
+    const finalize = () => {
+      stopListening();
+      const text = transcriptSegments.join(" ").trim();
+      if (text) {
+        // The user's spoken question, exactly as the STT model returned it,
+        // goes into the chat — then the LLM's reply follows via sendMessage.
+        setVoiceState(VoiceState.PROCESSING);
+        addMessage("user", text);
+        sendMessage(text);
+      } else if (voiceDetected) {
+        setVoiceState(VoiceState.IDLE);
+        addMessage("assistant", "I didn't catch that — tap the mic and try again.");
+      } else {
+        // Never detected voice — nothing was sent anywhere (zero API usage),
+        // but a LOCAL hint beats silent nothing-happened confusion: this
+        // exact case was reported in the field as "no response coming".
+        setVoiceState(VoiceState.IDLE);
+        addMessage(
+          "assistant",
+          "I didn't hear anything — check the mic level line in the browser console ([voice] level ...) and that the right microphone is selected, then tap to try again."
+        );
+      }
+    };
+
+    const conclude = () => {
+      if (concluded) return;
+      concluded = true;
+      clearTimeout(silenceTimerRef.current);
+      micRef.current?.stop();
+      micRef.current = null;
+      if (transcriptSegments.length > 0 || !voiceDetected) {
+        finalize();
+        return;
+      }
+      // Voice was heard but the last segment's transcript is still in
+      // flight — hold the socket open briefly so it isn't dropped.
+      graceTimerRef.current = setTimeout(finalize, FINAL_TRANSCRIPT_GRACE_MS);
+    };
+
+    const resetSilenceTimer = () => {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = setTimeout(conclude, SILENCE_STOP_MS);
+    };
+
+    const openSocket = () => {
+      socket = new VoiceSocketClient({
+        onOpen: () => {
+          setConnectionState(ConnectionState.CONNECTED);
+          socketOpen = true;
+          for (const buffered of preRoll) socket.sendAudioFrame(buffered);
+          preRoll.length = 0;
+        },
+        onReconnecting: () => setConnectionState(ConnectionState.RECONNECTING),
+        onEvent: (event) => {
+          if (event.type === "transcript" && event.is_final) {
+            const text = (event.text || "").trim();
+            if (text) transcriptSegments.push(text);
+            // After the silence stop, the arrival of the in-flight final
+            // segment is what we were holding the socket open for.
+            if (concluded) {
+              clearTimeout(graceTimerRef.current);
+              finalize();
+            }
+            return;
+          }
+          // VAD speech_end is deliberately NOT a stop signal anymore — it
+          // fires on brief mid-sentence pauses too. The 3s silence timer
+          // (fed by local frame energy) is the only thing that ends a turn.
+          if (event.type === "error") {
+            // Never fail silently — a bare flip back to "Tap to speak" with
+            // no explanation reads as "speech to text is not working" with
+            // nothing to act on.
+            stopIdle();
+            addMessage("assistant", `Speech recognition failed: ${event.reason || "unknown error"}. Please try again.`);
+          }
+        },
+      });
+      sttSocketRef.current = socket;
+      socket.connectSTT({ codec: "pcm_s16le", sample_rate: 16000, mode: "codemix" });
+    };
+
+    let noiseFloor = Infinity; // running minimum RMS = this session's silence level
+    let consecutiveVoiced = 0;
+    let lastLevelLog = 0;
+
+    const voiceThreshold = () =>
+      Math.max(MIN_VOICE_RMS, Math.min(noiseFloor, NOISE_FLOOR_CAP) * NOISE_FLOOR_MULTIPLIER);
+
+    const isVoicedFrame = (rms) => {
+      noiseFloor = Math.min(noiseFloor, rms);
+      return rms >= voiceThreshold();
+    };
+
+    const mic = new MicCapture((frame) => {
+      if (concluded) return; // silence stop already fired — nothing more leaves the mic
+      const rms = frameRMS(frame);
+      const voiced = isVoicedFrame(rms);
+
+      // Always-visible field diagnostics (console.info, NOT console.debug —
+      // Chrome hides debug by default, which made earlier gate failures
+      // undiagnosable): one line every couple of seconds with the exact
+      // numbers the gate is deciding on.
+      const now = Date.now();
+      if (now - lastLevelLog >= LEVEL_LOG_INTERVAL_MS) {
+        lastLevelLog = now;
+        console.info(
+          `[voice] level rms=${rms.toFixed(4)} threshold=${voiceThreshold().toFixed(4)} ` +
+            `voiced=${voiced} detected=${voiceDetected}`
+        );
+      }
+
+      if (!voiceDetected) {
+        preRoll.push(frame);
+        if (preRoll.length > PRE_ROLL_MAX_FRAMES) preRoll.shift();
+        consecutiveVoiced = voiced ? consecutiveVoiced + 1 : 0;
+        if (consecutiveVoiced >= CONSECUTIVE_VOICED_FRAMES_TO_OPEN) {
+          voiceDetected = true;
+          console.info("[voice] detected — rms:", rms.toFixed(4), "threshold:", voiceThreshold().toFixed(4));
+          resetSilenceTimer();
+          openSocket(); // only NOW does anything leave the browser
+        }
+        return;
+      }
+      if (voiced) resetSilenceTimer();
+      if (socketOpen) {
+        socket.sendAudioFrame(frame);
+      } else {
+        preRoll.push(frame); // socket still connecting — keep buffering, flushed on open
+      }
+    });
+
+    try {
+      await mic.start();
+      micRef.current = mic;
+    } catch (err) {
+      stopIdle();
+      const denied = err?.name === "NotAllowedError";
+      addMessage(
+        "assistant",
+        denied
+          ? "Microphone access was denied. Please allow microphone access for this site in your browser settings, then try again."
+          : `Couldn't start the microphone (${err?.name || "unknown error"}). Check that a working microphone is connected and not in use by another app.`
+      );
+      return;
+    }
+
+    // The ONE stop rule starts counting from here: 3s of silence — whether
+    // the user never speaks (mic stops, nothing was ever sent anywhere) or
+    // speaks and then goes quiet (their whole question is finalized).
+    resetSilenceTimer();
+
+    // Absolute ceiling: even if ambient noise keeps resetting the silence
+    // timer, the session concludes (finalizing whatever was transcribed)
+    // instead of listening forever.
+    maxListenTimerRef.current = setTimeout(conclude, MAX_LISTEN_MS);
+  }, [addMessage, sendMessage, setConnectionState, setVoiceState, stopListening]);
+
+  const toggle = useCallback(() => {
+    if (useAppStore.getState().voiceState === VoiceState.IDLE) {
+      startListening();
+    } else {
+      stopListening();
+      setVoiceState(VoiceState.IDLE);
+    }
+  }, [startListening, stopListening, setVoiceState]);
+
+  return { toggle, send };
+}

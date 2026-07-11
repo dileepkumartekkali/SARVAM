@@ -1,0 +1,67 @@
+# Prometheus alerting rules against the metrics in agent_core/observability/
+# metrics.py. Load into a Prometheus server scraping both /metrics endpoints
+# (backend :8000, speech-gateway :8100). Not deployed/tested against a live
+# Prometheus in this session — no cluster/monitoring stack exists here; this
+# is the config artifact, verified for valid PromQL syntax only.
+groups:
+  - name: maav-error-rate
+    rules:
+      - alert: HighLLMErrorRate
+        expr: |
+          rate(maav_errors_total{stage="llm"}[5m])
+          /
+          (rate(maav_llm_latency_seconds_count[5m]) + rate(maav_llm_ttfb_seconds_count[5m]) + 0.001)
+          > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "LLM error rate above 5% over 5m — all providers may be degraded, not just one (router already falls through the configured order)."
+
+      - alert: HighSTTErrorRate
+        expr: |
+          rate(maav_errors_total{stage="stt"}[5m])
+          /
+          (rate(maav_stt_latency_seconds_count[5m]) + 0.001)
+          > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "STT error rate above 10% over 5m — check Sarvam STT status before assuming a gateway-side bug."
+
+      - alert: HighTTSErrorRate
+        expr: |
+          rate(maav_errors_total{stage="tts"}[5m])
+          /
+          (rate(maav_tts_ttfb_seconds_count[5m]) + 0.001)
+          > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TTS error rate above 10% over 5m."
+
+  - name: maav-reconnect-storm
+    rules:
+      - alert: STTReconnectStorm
+        expr: rate(maav_reconnects_total{stage="stt"}[5m]) > 2
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "STT reconnect rate > 2/s sustained for 3m — a reconnect storm, not isolated drops. Likely Sarvam-side outage or a gateway network issue; check Sarvam status page before restarting pods."
+
+  - name: maav-session-volume
+    rules:
+      - alert: RateLimiterSaturated
+        # A sustained run of 1008 (policy violation) closes is the rate
+        # limiter itself becoming the bottleneck — see the load-test report
+        # (docs/LOAD_TEST_REPORT.md): this fires well before any CPU/connection
+        # ceiling in practice.
+        expr: rate(maav_errors_total{stage="rate_limit"}[5m]) > 1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Voice session rate limiting is actively rejecting connections — raise STT_SESSION_RATE_LIMIT or move to per-user keying if this is legitimate traffic, not abuse."

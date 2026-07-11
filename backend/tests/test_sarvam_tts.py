@@ -1,0 +1,104 @@
+import base64
+import json
+
+import pytest
+
+from agent_core.speech.sarvam_tts import SarvamTTSClient
+
+from ._fake_ws import FakeWSConnection, fake_connect_returning
+
+
+async def _texts(*parts):
+    for p in parts:
+        yield p
+
+
+def _audio_event(raw: bytes) -> str:
+    return json.dumps({"type": "audio", "data": {"audio": base64.b64encode(raw).decode(), "content_type": "audio/mp3"}})
+
+
+_FINAL_EVENT = json.dumps({"type": "event", "data": {"event_type": "final", "message": "Processing completed"}})
+
+
+async def test_synthesize_reuses_one_socket_for_all_chunks(monkeypatch):
+    """One `connect()` call for the whole utterance — not one per chunk."""
+    monkeypatch.setenv("SARVAM_API_KEY", "test-key")
+    connect_calls = []
+
+    incoming = [
+        _audio_event(b"AUDIO_CHUNK_1"),
+        _FINAL_EVENT,
+        _audio_event(b"AUDIO_CHUNK_2"),
+        _FINAL_EVENT,
+    ]
+    ws = FakeWSConnection(incoming=incoming)
+
+    def connect(url, **kwargs):
+        connect_calls.append(url)
+        return ws
+
+    client = SarvamTTSClient(connect=connect)
+
+    audio = [a async for a in client.synthesize(_texts("Hello", "world"), language="hi")]
+
+    assert audio == [b"AUDIO_CHUNK_1", b"AUDIO_CHUNK_2"]
+    assert len(connect_calls) == 1  # exactly one socket for the whole utterance
+    # Two text messages went out over that same socket, per the real protocol.
+    text_messages = [json.loads(m) for m in ws.sent if isinstance(m, str) and '"text"' in m and '"config"' not in m]
+    assert len(text_messages) == 2
+    assert text_messages[0]["type"] == "text"
+    assert text_messages[0]["data"]["text"] == "Hello"
+
+
+async def test_config_message_uses_real_sarvam_field_names(monkeypatch):
+    """Regression test for the real bug found in production testing: the
+    original protocol used flat `language`/`voice` fields and a `convert`
+    type — Sarvam rejected it with a 422. The real API needs a nested `data`
+    object with `target_language_code` and a required `speaker`."""
+    monkeypatch.setenv("SARVAM_API_KEY", "test-key")
+    ws = FakeWSConnection(incoming=[_FINAL_EVENT])
+    client = SarvamTTSClient(connect=fake_connect_returning(ws))
+
+    _ = [a async for a in client.synthesize(_texts("hi"), language="hi", model="bulbul:v3")]
+
+    config_message = json.loads(ws.sent[0])
+    assert config_message["type"] == "config"
+    assert config_message["data"]["target_language_code"] == "hi-IN"
+    assert "speaker" in config_message["data"]  # required by Sarvam — must never be omitted
+    assert "language" not in config_message  # the old, wrong, flat field
+
+
+async def test_error_event_raises_tts_stream_error(monkeypatch):
+    monkeypatch.setenv("SARVAM_API_KEY", "test-key")
+    error_event = json.dumps({"type": "error", "data": {"message": "bad request", "code": 422}})
+    ws = FakeWSConnection(incoming=[error_event])
+    client = SarvamTTSClient(connect=fake_connect_returning(ws))
+
+    from agent_core.speech.sarvam_tts import TTSStreamError
+
+    with pytest.raises(TTSStreamError):
+        _ = [a async for a in client.synthesize(_texts("hi"), language="hi")]
+
+
+async def test_v3_uses_temperature_not_pitch_loudness():
+    data = SarvamTTSClient._config_data("hi", "bulbul:v3", voice=None, pace=1.0, pitch=5, loudness=5, temperature=0.7)
+
+    assert "temperature" in data
+    assert "pitch" not in data
+    assert "loudness" not in data
+
+
+async def test_v2_uses_pitch_loudness_not_temperature():
+    data = SarvamTTSClient._config_data("hi", "bulbul:v2", voice=None, pace=1.0, pitch=5, loudness=5, temperature=0.7)
+
+    assert "pitch" in data
+    assert "loudness" in data
+    assert "temperature" not in data
+
+
+async def test_pace_out_of_range_for_model_rejected():
+    with pytest.raises(ValueError):
+        SarvamTTSClient._config_data("hi", "bulbul:v3", voice=None, pace=2.5)  # v3 max is 2.0
+
+    # Same pace is valid for v2 (range 0.3-3.0).
+    SarvamTTSClient._config_data("hi", "bulbul:v2", voice=None, pace=2.5)

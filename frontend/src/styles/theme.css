@@ -1,0 +1,147 @@
+/* Design tokens. Light is the default; dark overrides via prefers-color-scheme.
+   Not a shadcn/default look: a warm-neutral ink palette + one confident
+   accent (a saffron-leaning amber, nodding to the product's Indian-language
+   focus without being kitsch), generous radii, soft layered shadows instead
+   of hard borders. */
+:root {
+  --ink-950: #14110f;
+  --ink-900: #201b18;
+  --ink-700: #4a413b;
+  --ink-500: #756a62;
+  --ink-300: #b4a89e;
+  --ink-100: #ece5de;
+  --ink-50: #f8f4f0;
+  --paper: #fffdfb;
+
+  --accent-600: #c2660c;
+  --accent-500: #e07b1a;
+  --accent-400: #f0954a;
+  --accent-100: #fde9d2;
+
+  --listening: #2f9e6e;
+  --speaking: #3a7bd5;
+  --error: #d9483b;
+
+  --radius-sm: 8px;
+  --radius-md: 14px;
+  --radius-lg: 22px;
+  --radius-full: 999px;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-size-xs: 0.75rem;
+  --font-size-sm: 0.875rem;
+  --font-size-md: 1rem;
+  --font-size-lg: 1.125rem;
+  --font-size-xl: 1.375rem;
+
+  --shadow-1: 0 1px 2px rgba(20, 17, 15, 0.06), 0 1px 1px rgba(20, 17, 15, 0.04);
+  --shadow-2: 0 4px 16px rgba(20, 17, 15, 0.10), 0 1px 3px rgba(20, 17, 15, 0.06);
+  --shadow-3: 0 12px 32px rgba(20, 17, 15, 0.16), 0 2px 6px rgba(20, 17, 15, 0.08);
+
+  --bg: var(--ink-50);
+  --surface: var(--paper);
+  --surface-raised: #ffffff;
+  --text-primary: var(--ink-950);
+  --text-secondary: var(--ink-500);
+  --border-subtle: var(--ink-100);
+
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16130f;
+    --surface: #1e1a16;
+    --surface-raised: #26211c;
+    --text-primary: #f5efe8;
+    --text-secondary: #b4a89e;
+    --border-subtle: #33291f;
+    --accent-100: #3a2a13;
+    color-scheme: dark;
+  }
+}
+
+:root[data-theme="dark"] {
+  --bg: #16130f;
+  --surface: #1e1a16;
+  --surface-raised: #26211c;
+  --text-primary: #f5efe8;
+  --text-secondary: #b4a89e;
+  --border-subtle: #33291f;
+  --accent-100: #3a2a13;
+  color-scheme: dark;
+}
+
+:root[data-theme="light"] {
+  --bg: var(--ink-50);
+  --surface: var(--paper);
+  --surface-raised: #ffffff;
+  --text-primary: var(--ink-950);
+  --text-secondary: var(--ink-500);
+  --border-subtle: var(--ink-100);
+  color-scheme: light;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  background: var(--bg);
+  color: var(--text-primary);
+  -webkit-font-smoothing: antialiased;
+}
+
+button {
+  font-family: inherit;
+}
+
+@keyframes pulse-ring {
+  0% {
+    box-shadow: 0 0 0 0 rgba(47, 158, 110, 0.45);
+  }
+  100% {
+    box-shadow: 0 0 0 18px rgba(47, 158, 110, 0);
+  }
+}
+
+@keyframes speak-bar {
+  0%,
+  100% {
+    transform: scaleY(0.3);
+  }
+  50% {
+    transform: scaleY(1);
+  }
+}
+
+@keyframes flash-interrupt {
+  0% {
+    background: var(--error);
+  }
+  100% {
+    background: transparent;
+  }
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}

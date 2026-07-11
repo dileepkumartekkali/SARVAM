@@ -1,0 +1,123 @@
+# Speech Gateway: canary via Argo Rollouts (requires the Argo Rollouts
+# controller/CRDs installed — not a plain Deployment) — this is the one
+# service where a rollout genuinely cannot just kill old pods (S2S plan §7).
+#
+# Three cooperating mechanisms, all required together:
+#  1. terminationGracePeriodSeconds: 300 — long enough for a real voice
+#     session (a few minutes) to finish naturally before the pod is force-
+#     killed.
+#  2. preStop sleep: covers the propagation delay between "pod marked
+#     Terminating" and "removed from every kube-proxy/ingress endpoint
+#     table" — without this, a just-terminating pod can still receive a
+#     handful of new connections for a few seconds.
+#  3. uvicorn's own graceful shutdown (--timeout-graceful-shutdown, set to
+#     match the grace period): on SIGTERM, stop accepting new WebSocket
+#     upgrades but let already-established ones run to completion.
+# scaleDownDelaySeconds on the canary steps is Argo's own knob for the same
+# idea at the ReplicaSet level: old-version pods aren't scaled to 0 the
+# instant traffic shifts to the new version — they're kept alive to drain.
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: maav-speech-gateway
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: maav-speech-gateway
+  template:
+    metadata:
+      labels:
+        app: maav-speech-gateway
+    spec:
+      terminationGracePeriodSeconds: 300
+      containers:
+        - name: speech-gateway
+          image: maav-speech-gateway:latest # CI replaces with the built SHA tag
+          command:
+            - uvicorn
+            - agent_core.speech_gateway.main:gateway_app
+            - --host=0.0.0.0
+            - --port=8100
+            - --timeout-graceful-shutdown=290
+          ports:
+            - containerPort: 8100
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: 1
+              memory: 512Mi
+          env:
+            - name: SARVAM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: maav-speech-gateway-secrets
+                  key: sarvam-api-key
+            - name: AZURE_SPEECH_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: maav-speech-gateway-secrets
+                  key: azure-speech-key
+            - name: AZURE_SPEECH_REGION
+              valueFrom:
+                secretKeyRef:
+                  name: maav-speech-gateway-secrets
+                  key: azure-speech-region
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8100
+            periodSeconds: 5
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 10"]
+  strategy:
+    canary:
+      steps:
+        - setWeight: 10
+        - pause: { duration: 5m } # bake at 10% — watch error-rate/reconnect alerts before continuing
+        - setWeight: 50
+        - pause: { duration: 5m }
+        - setWeight: 100
+      # Old-version pods are kept running for this long after traffic shifts
+      # away from them, so in-flight conversations they're still holding
+      # finish naturally instead of being cut at the traffic-shift instant.
+      scaleDownDelaySeconds: 300
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: maav-speech-gateway
+spec:
+  scaleTargetRef:
+    apiVersion: argoproj.io/v1alpha1
+    kind: Rollout
+    name: maav-speech-gateway
+  minReplicas: 3
+  maxReplicas: 50
+  metrics:
+    # Per the load-test report: for this service, concurrent connection
+    # count (not CPU) is the observed constraint — scale on connections via
+    # a custom metric (maav_voice_sessions_started_total rate through an
+    # adapter, e.g. prometheus-adapter), not raw CPU utilization.
+    - type: Pods
+      pods:
+        metric:
+          name: maav_active_websocket_connections
+        target:
+          type: AverageValue
+          averageValue: "400" # see docs/LOAD_TEST_REPORT.md for how this number was derived
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: maav-speech-gateway
+spec:
+  selector:
+    app: maav-speech-gateway
+  ports:
+    - port: 80
+      targetPort: 8100

@@ -1,0 +1,56 @@
+# Deploy workflow — written against the actual k8s manifests in infra/k8s/,
+# not run against a real cluster in this session (no cluster credentials
+# exist here). Backend: blue-green via two Services + a traffic-cutover
+# step. Speech Gateway: canary via Argo Rollouts specifically because it
+# needs connection-draining (S2S plan §7 — "cannot kill pods mid-
+# conversation"), which a plain Deployment rolling-update cannot express;
+# blue-green's instant cutover is exactly wrong for it too, since it would
+# still cut live WebSocket connections at the swap. Argo Rollouts' canary
+# step + `scaleDownDelaySeconds` is what actually lets old pods finish their
+# in-flight conversations before termination.
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        default: staging
+        type: choice
+        options: [staging, production]
+
+jobs:
+  deploy-backend-blue-green:
+    name: Deploy backend (blue-green)
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure kubectl
+        run: echo "kubeconfig setup — requires a real cluster context, not present in this session"
+      - name: Apply the new (green) deployment
+        run: kubectl apply -f infra/k8s/backend-deployment-green.yaml
+      - name: Wait for green readiness
+        run: kubectl rollout status deployment/maav-backend-green --timeout=180s
+      - name: Run smoke test against green (internal service, pre-cutover)
+        run: curl -f http://maav-backend-green.internal/health
+      - name: Cut traffic from blue to green
+        run: kubectl patch service maav-backend -p '{"spec":{"selector":{"track":"green"}}}'
+      - name: Scale down blue after a bake period
+        run: |
+          sleep 300
+          kubectl scale deployment/maav-backend-blue --replicas=0
+
+  deploy-speech-gateway-canary:
+    name: Deploy speech-gateway (canary, connection-draining)
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure kubectl
+        run: echo "kubeconfig setup — requires a real cluster context, not present in this session"
+      - name: Apply the Argo Rollout (canary steps + connection draining)
+        run: kubectl apply -f infra/k8s/speech-gateway-rollout.yaml
+      - name: Watch rollout — each canary step waits for the drain window
+        run: kubectl argo rollouts get rollout maav-speech-gateway --watch --timeout 900s
