@@ -14,12 +14,19 @@ from .providers.anthropic import AnthropicProvider
 from .providers.gemini import GeminiProvider
 from .providers.openai_compatible import OpenAICompatibleProvider
 
-# Gemini primary (2.5 Flash — fast, cheap, no reasoning-token overhead unlike
-# Sarvam's models), everything else as fallback in this order. NOT verified
-# against a live Gemini account as of this change — no GEMINI_API_KEY was
-# configured yet; see gemini.py's docstring. Confirm live the moment a real
-# key is in place, the same way every other provider in this file was.
-_DEFAULT_ORDER = "gemini,sarvam,grok,claude,gpt"
+# Grok (Groq-hosted Llama) primary — verified live at ~1s per call,
+# consistently, all session. Latency complaint traced to two real, additive
+# costs of the previous order (gemini,sarvam,...): (1) Gemini's Google Cloud
+# project has zero usable quota (confirmed live — every model 404s or
+# 429s), so it was failing on EVERY LLM call in a turn (main generation,
+# self-check, any correction retry) before ever falling through — pure
+# wasted latency, no benefit; (2) Sarvam's models are chain-of-thought
+# reasoners with real, verified-live overhead (multiple seconds, sometimes
+# hundreds of tokens just to reach a short reply) — fine as a fallback, bad
+# as the thing actually serving every request. Gemini is kept at the end
+# (not removed) in case its quota is ever fixed — with Grok and Sarvam
+# both healthy, it's essentially never reached.
+_DEFAULT_ORDER = "grok,sarvam,gemini,claude,gpt"
 
 
 def _build_provider(name: str) -> LLMProvider:
