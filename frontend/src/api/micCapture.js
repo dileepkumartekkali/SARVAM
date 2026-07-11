@@ -33,7 +33,14 @@ export class MicCapture {
     this._pending = []; // resampled-to-16kHz samples awaiting a full FRAME_SAMPLES chunk
   }
 
-  async start() {
+  /**
+   * @param {AudioContext} [preCreatedContext] - Pass an AudioContext that was
+   * created SYNCHRONOUSLY inside the click handler. Mobile browsers (iOS Safari,
+   * Chrome Android) suspend or reject AudioContext creation in async callbacks
+   * because the user-gesture context has already been lost by then.
+   * Call `new AudioContext()` directly in your onClick handler and pass it here.
+   */
+  async start(preCreatedContext) {
     this._stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         channelCount: 1,
@@ -47,7 +54,13 @@ export class MicCapture {
     // the answer (a virtual/disconnected device was selected).
     this.deviceLabel = this._stream.getAudioTracks()[0]?.label || "unknown device";
     console.info("[voice] using microphone:", this.deviceLabel);
-    this._context = new AudioContext();
+    // Use the pre-created context (gesture-safe on mobile) or create one now
+    // as fallback for desktop where timing is not restricted.
+    this._context = preCreatedContext || new AudioContext();
+    // Mobile browsers auto-suspend AudioContext — must explicitly resume it.
+    if (this._context.state === "suspended") {
+      await this._context.resume();
+    }
     // mic-worklet.js lives in public/ and is served at the site root as /mic-worklet.js.
     // Do NOT use `new URL("./mic-worklet.js", import.meta.url)` here — Vite resolves
     // that to /assets/mic-worklet.js (the bundle output dir), which is a 404 because

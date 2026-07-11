@@ -179,7 +179,7 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
     [addMessage, sendMessage]
   );
 
-  const startListening = useCallback(async () => {
+  const startListening = useCallback(async (preCreatedContext) => {
     if (sttSocketRef.current || micRef.current) return; // already listening — never overlap two sessions
     setVoiceState(VoiceState.LISTENING);
 
@@ -336,7 +336,7 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
     });
 
     try {
-      await mic.start();
+      await mic.start(preCreatedContext);
       micRef.current = mic;
     } catch (err) {
       stopIdle();
@@ -363,7 +363,12 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
 
   const toggle = useCallback(() => {
     if (useAppStore.getState().voiceState === VoiceState.IDLE) {
-      startListening();
+      // AudioContext MUST be created synchronously here, inside the click
+      // handler, before any async work. Mobile browsers (iOS Safari, Chrome
+      // Android) block AudioContext creation in async callbacks because the
+      // user-gesture context is lost the moment the call stack goes async.
+      const audioCtx = new AudioContext();
+      startListening(audioCtx);
     } else {
       stopListening();
       setVoiceState(VoiceState.IDLE);
