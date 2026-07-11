@@ -55,9 +55,19 @@ class Principal:
 def decode_token(token: str, config: AuthConfig | None = None) -> Principal:
     cfg = config or AuthConfig()
     try:
+        secret = cfg.secret()
+    except RuntimeError as e:
+        # A real bug hit in production: a missing JWT_SIGNING_SECRET raised
+        # here, uncaught, as a bare RuntimeError — every authenticated
+        # request (including /chat) crashed with an unhandled-exception 500
+        # and no diagnosable message. This is a server misconfiguration, not
+        # a client auth failure, so it stays a 500 — but now with a message
+        # that actually says what's missing, in logs and the response body.
+        raise AuthError(f"server misconfigured: {e}", status_code=status.HTTP_500_INTERNAL_SERVER_ERROR) from e
+    try:
         claims = jwt.decode(
             token,
-            cfg.secret(),
+            secret,
             algorithms=[cfg.algorithm],
             audience=cfg.audience,
             issuer=cfg.issuer,

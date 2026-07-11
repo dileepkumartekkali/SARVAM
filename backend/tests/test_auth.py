@@ -13,6 +13,21 @@ def _make_token(*, secret="test-secret", sub="user-1", roles=None, exp_delta=360
     return jwt.encode(payload, secret, algorithm="HS256")
 
 
+def test_missing_signing_secret_is_a_clean_500_not_an_unhandled_crash(monkeypatch):
+    """Real bug hit in production: a missing JWT_SIGNING_SECRET on the
+    deployed server raised a bare, uncaught RuntimeError from
+    AuthConfig.secret() — every authenticated request (including /chat)
+    crashed with an unhandled-exception 500 and no diagnosable message."""
+    monkeypatch.delenv("JWT_SIGNING_SECRET", raising=False)
+    token = _make_token()
+
+    with pytest.raises(AuthError) as exc_info:
+        decode_token(token)
+
+    assert exc_info.value.status_code == 500
+    assert "JWT_SIGNING_SECRET" in str(exc_info.value)
+
+
 def test_valid_token_decodes_to_principal(monkeypatch):
     monkeypatch.setenv("JWT_SIGNING_SECRET", "test-secret")
     token = _make_token(roles=["admin", "voice_write"])

@@ -159,6 +159,9 @@ backend/
     observability/    structured JSON logging, OpenTelemetry tracing, Prometheus metrics
   scripts/            run_dev_server.py (local dev), load_test.py, chaos_test.py — see below
   tests/              243 tests (230 pass unconditionally, 13 skip unless a real LLM key + a flag are set)
+  prompts/            versioned system-prompt template files (text_mode / voice_mode) — lives
+                      inside backend/ (not the repo root) so it's always inside the Docker
+                      build context, whatever directory a deployment roots its build at
   Dockerfile, Dockerfile.gateway   multi-stage builds, one per service
 frontend/
   src/
@@ -166,7 +169,6 @@ frontend/
     components/       chat UI, voice orb (state-machine visual), login, language badge
     hooks/            useVoiceSession (STT WS + visual state machine)
     store/            Zustand store — see its file header for why Zustand, not Redux/Context
-prompts/              versioned system-prompt template files (text_mode / voice_mode)
 infra/
   k8s/                blue-green (backend) + canary-with-connection-draining (gateway) manifests
   terraform/          AWS (EKS/RDS/ElastiCache) — written, never applied (no cloud creds here)
