@@ -48,8 +48,11 @@ export class MicCapture {
     this.deviceLabel = this._stream.getAudioTracks()[0]?.label || "unknown device";
     console.info("[voice] using microphone:", this.deviceLabel);
     this._context = new AudioContext();
-    const workletUrl = new URL("./mic-worklet.js", import.meta.url);
-    await this._context.audioWorklet.addModule(workletUrl);
+    // mic-worklet.js lives in public/ and is served at the site root as /mic-worklet.js.
+    // Do NOT use `new URL("./mic-worklet.js", import.meta.url)` here — Vite resolves
+    // that to /assets/mic-worklet.js (the bundle output dir), which is a 404 because
+    // public/ files are copied to the root, not to assets/.
+    await this._context.audioWorklet.addModule("/mic-worklet.js");
     this._source = this._context.createMediaStreamSource(this._stream);
     this._worklet = new AudioWorkletNode(this._context, "mic-capture");
     this._worklet.port.onmessage = (e) => {
