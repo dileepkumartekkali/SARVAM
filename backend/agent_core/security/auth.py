@@ -84,11 +84,16 @@ def decode_token(token: str, config: AuthConfig | None = None) -> Principal:
 async def get_current_principal(
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
 ) -> Principal:
-    """FastAPI dependency: 401 on missing/invalid/expired bearer token."""
+    """FastAPI dependency: 401 on missing/invalid/expired bearer token.
+
+    `JWT_AUDIENCE` is optional (unset = audience unchecked, same as before) —
+    set it to "authenticated" when the IdP is Supabase, which stamps that
+    exact value into every token's `aud` claim.
+    """
     if credentials is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="missing bearer token")
     try:
-        return decode_token(credentials.credentials)
+        return decode_token(credentials.credentials, AuthConfig(audience=os.environ.get("JWT_AUDIENCE")))
     except AuthError as e:
         raise HTTPException(e.status_code, detail=str(e)) from e
 

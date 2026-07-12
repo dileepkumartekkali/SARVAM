@@ -22,7 +22,7 @@ export default function ChatView({ messages }) {
         </div>
       )}
       {messages.map((m) => (
-        <MessageBubble key={m.id} role={m.role} text={m.text} streaming={m.streaming} />
+        <MessageBubble key={m.id} role={m.role} text={m.text} streaming={m.streaming} audioPath={m.audioPath} />
       ))}
       <div ref={bottomRef} />
     </div>

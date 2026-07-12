@@ -27,6 +27,12 @@ export class TTSPlayer {
     this._context = null;
     this._queue = [];
     this._draining = false;
+    // Decoded (post-decode, uniform Float32 PCM) samples for the current
+    // utterance — capturing here rather than the raw chunk bytes sidesteps
+    // Sarvam-vs-Azure-fallback format differences, since everything is
+    // already normalized by the time it lands here.
+    this._capturedChannels = [];
+    this._capturedSampleRate = null;
   }
 
   playChunk(arrayBuffer) {
@@ -60,6 +66,8 @@ export class TTSPlayer {
     } catch {
       audioBuffer = this._decodeRawPCM16(context, arrayBuffer);
     }
+    if (this._capturedSampleRate == null) this._capturedSampleRate = audioBuffer.sampleRate;
+    this._capturedChannels.push(audioBuffer.getChannelData(0).slice());
     return new Promise((resolve) => {
       const source = context.createBufferSource();
       source.buffer = audioBuffer;
@@ -85,10 +93,57 @@ export class TTSPlayer {
     return this._context;
   }
 
+  /** Concatenates everything played since the last `finish()`/`close()` into
+   * one WAV blob for replay storage. Returns `null` if nothing played. */
+  finish() {
+    if (this._capturedChannels.length === 0) return null;
+    const totalLength = this._capturedChannels.reduce((sum, c) => sum + c.length, 0);
+    const merged = new Float32Array(totalLength);
+    let offset = 0;
+    for (const chunk of this._capturedChannels) {
+      merged.set(chunk, offset);
+      offset += chunk.length;
+    }
+    const blob = encodeWav(merged, this._capturedSampleRate);
+    this._capturedChannels = [];
+    this._capturedSampleRate = null;
+    return blob;
+  }
+
   close() {
     this._context?.close();
     this._context = null;
     this._queue = [];
     this._draining = false;
+    this._capturedChannels = [];
+    this._capturedSampleRate = null;
   }
+}
+
+/** Minimal 44-byte-header PCM16 mono WAV encoder — no library needed for
+ * this one shape (mono, 16-bit, whatever sample rate we decoded at). */
+function encodeWav(samples, sampleRate) {
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
+  const writeString = (offset, str) => {
+    for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+  };
+  writeString(0, "RIFF");
+  view.setUint32(4, 36 + samples.length * 2, true);
+  writeString(8, "WAVE");
+  writeString(12, "fmt ");
+  view.setUint32(16, 16, true); // fmt chunk size
+  view.setUint16(20, 1, true); // PCM
+  view.setUint16(22, 1, true); // mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true); // byte rate
+  view.setUint16(32, 2, true); // block align
+  view.setUint16(34, 16, true); // bits per sample
+  writeString(36, "data");
+  view.setUint32(40, samples.length * 2, true);
+  for (let i = 0; i < samples.length; i++) {
+    const clamped = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(44 + i * 2, clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff, true);
+  }
+  return new Blob([buffer], { type: "audio/wav" });
 }

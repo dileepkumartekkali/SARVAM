@@ -10,7 +10,6 @@ from _dotenv import load_dotenv
 
 load_dotenv()
 
-os.environ.setdefault("DEV_AUTH_ENABLED", "true")
 os.environ.setdefault("JWT_SIGNING_SECRET", "dev-preview-secret-not-for-prod")
 os.environ.setdefault("CORS_ALLOWED_ORIGINS", "http://localhost:3000")
 

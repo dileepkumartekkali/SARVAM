@@ -105,17 +105,16 @@ conversation" — see [Known gaps](#known-gaps).
 ### 3. Auth flow
 
 ```
-Client -> POST /auth/dev-login {username} -> Backend
-          (404 unless DEV_AUTH_ENABLED=true)
-       <- {access_token}  (JWT, HS256, 1h expiry, roles: [dev_user])
+Client -> Supabase Auth (Google OAuth) -> {access_token} (JWT, HS256, sub=user UUID)
 
 Client -> POST /chat, Authorization: Bearer <token> -> Backend
-          get_current_principal() verifies signature/expiry/claims (401 if invalid)
+          get_current_principal() verifies signature/expiry/claims/audience (401 if invalid)
 ```
 
-There is no real OAuth identity-provider integration — `/auth/dev-login`
-exists purely so the login flow is genuinely clickable end to end without
-one. See `docs/THREAT_MODEL.md` for what this means as accepted risk.
+The backend never issues tokens itself — it only verifies JWTs an IdP signed
+(`agent_core/security/auth.py`). Supabase is the IdP: `JWT_SIGNING_SECRET` is
+the Supabase project's JWT secret, `JWT_AUDIENCE=authenticated` matches the
+`aud` claim Supabase stamps into every token.
 
 ### 4. Agentic tool-calling loop
 

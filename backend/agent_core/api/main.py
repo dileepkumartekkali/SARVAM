@@ -7,11 +7,9 @@ WebSocket routes live in the Speech Gateway (its own service).
 from __future__ import annotations
 
 import os
-import time
 from typing import Literal
 
-import jwt
-from fastapi import Depends, FastAPI, HTTPException, Response
+from fastapi import Depends, FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -19,7 +17,8 @@ from ..llm_adapter import build_router_from_env
 from ..observability.logging_config import configure_logging
 from ..observability.metrics import metrics_response
 from ..observability.tracing import init_tracing
-from ..security.auth import AuthConfig, Principal, get_current_principal
+from ..persistence import chat_store
+from ..security.auth import Principal, get_current_principal
 from ..supervisor.graph import build_text_graph
 from ..supervisor.state import Mode, SessionState
 from ..tools import build_default_registry
@@ -81,32 +80,6 @@ async def metrics() -> Response:
     return Response(content=body, media_type=content_type)
 
 
-class DevLoginRequest(BaseModel):
-    username: str
-
-
-class DevLoginResponse(BaseModel):
-    access_token: str
-
-
-@app.post("/auth/dev-login", response_model=DevLoginResponse)
-async def dev_login(req: DevLoginRequest) -> DevLoginResponse:
-    """Dev-only token issuance so the frontend's auth flow is real and
-    clickable end-to-end without a live OAuth IdP (see docs/THREAT_MODEL.md —
-    real IdP integration is accepted risk for v1, not solved here). 404s
-    unless DEV_AUTH_ENABLED=true, so it's never reachable by default.
-    """
-    if os.environ.get("DEV_AUTH_ENABLED", "").lower() != "true":
-        raise HTTPException(status_code=404)
-    config = AuthConfig()
-    token = jwt.encode(
-        {"sub": req.username, "roles": ["dev_user"], "exp": int(time.time()) + 3600},
-        config.secret(),
-        algorithm=config.algorithm,
-    )
-    return DevLoginResponse(access_token=token)
-
-
 class ChatRequest(BaseModel):
     session_id: str
     conversation_id: str
@@ -143,6 +116,10 @@ class ChatResponse(BaseModel):
     language_confidence: float | None
     is_code_mixed: bool
     pending_confirmation: PendingConfirmationResponse | None = None
+    # The persisted assistant message's row id (null if persistence isn't
+    # configured) — the frontend needs this to later attach a replay audio
+    # path to the right row once TTS finishes (see chat_store.set_message_audio_path).
+    message_id: str | None = None
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -157,6 +134,10 @@ async def chat(
         thread_id=req.thread_id,
         mode=Mode(req.mode),
     )
+    conversation_id = await chat_store.get_or_create_conversation(principal.subject)
+    if conversation_id is not None:
+        await chat_store.insert_message(conversation_id, principal.subject, "user", req.message)
+
     result = await graph.ainvoke(
         {
             "session": session,
@@ -168,6 +149,13 @@ async def chat(
     )
     detected_session: SessionState = result["session"]
     pending = result.get("pending_confirmation")
+
+    assistant_message_id = None
+    if conversation_id is not None:
+        assistant_message_id = await chat_store.insert_message(
+            conversation_id, principal.subject, "assistant", result["response"], detected_session.response_language
+        )
+
     return ChatResponse(
         response=result["response"],
         prompt_version=result["prompt_version"],
@@ -181,4 +169,35 @@ async def chat(
             if pending is not None
             else None
         ),
+        message_id=assistant_message_id,
     )
+
+
+class StoredMessage(BaseModel):
+    id: str
+    role: Literal["user", "assistant"]
+    content: str
+    audio_path: str | None
+    response_language: str | None
+
+
+@app.get("/conversations/current/messages", response_model=list[StoredMessage])
+async def get_current_conversation_messages(
+    principal: Principal = Depends(get_current_principal),
+) -> list[StoredMessage]:
+    """The one ongoing conversation for the authenticated user — what the
+    frontend calls once on load to repopulate the chat box after a refresh."""
+    conversation_id = await chat_store.get_or_create_conversation(principal.subject)
+    if conversation_id is None:
+        return []
+    rows = await chat_store.list_messages(conversation_id, principal.subject)
+    return [
+        StoredMessage(
+            id=str(r["id"]),
+            role=r["role"],
+            content=r["content"],
+            audio_path=r["audio_path"],
+            response_language=r["response_language"],
+        )
+        for r in rows
+    ]

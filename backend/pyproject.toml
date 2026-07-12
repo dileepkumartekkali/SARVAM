@@ -17,6 +17,11 @@ dependencies = [
     # Prod checkpointer backend. Optional at runtime: MemorySaver fallback is used
     # when no DSN is configured, so local dev / CI / smoke test need no database.
     "langgraph-checkpoint-postgres>=2.0",
+    # Direct async Postgres access for persistent chat/audio history
+    # (agent_core/persistence/chat_store.py) — self-contained wheels, no
+    # system libpq dependency (unlike psycopg's binary extra), which matters
+    # for a clean Render deploy.
+    "asyncpg>=0.29",
     # HTTP client for all LLM provider adapters (Grok/GPT/Sarvam share an
     # OpenAI-compatible schema; Claude/Gemini have their own). One client
     # instead of five vendor SDKs.

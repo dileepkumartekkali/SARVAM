@@ -27,6 +27,7 @@ import sys
 import time
 
 import httpx
+import jwt
 import websockets
 
 BACKEND_URL = "http://localhost:8002"
@@ -77,11 +78,12 @@ async def chat_turn(client: httpx.AsyncClient, token: str, thread_id: str, messa
     return resp.json()
 
 
-async def get_dev_token() -> str:
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(f"{BACKEND_URL}/auth/dev-login", json={"username": "chaos-test"})
-        resp.raise_for_status()
-        return resp.json()["access_token"]
+def get_dev_token() -> str:
+    # No server-side token-issuing route exists anymore (real auth is
+    # Supabase-issued JWTs) — mint one locally with the same shared secret
+    # the backend verifies against, exactly like the old /auth/dev-login did.
+    secret = os.environ.get("JWT_SIGNING_SECRET", "dev-preview-secret-not-for-prod")
+    return jwt.encode({"sub": "chaos-test", "exp": int(time.time()) + 3600}, secret, algorithm="HS256")
 
 
 async def part1_gateway_disconnect_is_observed(gateway_proc: subprocess.Popen) -> bool:
@@ -104,7 +106,7 @@ async def part1_gateway_disconnect_is_observed(gateway_proc: subprocess.Popen) -
 
 async def part2_checkpointer_survives_gateway_death() -> bool:
     print("\n--- Part 2: backend conversation continuity while gateway is DEAD ---")
-    token = await get_dev_token()
+    token = get_dev_token()
     thread_id = "chaos-thread-1"
     async with httpx.AsyncClient() as client:
         r1 = await chat_turn(client, token, thread_id, "This is turn one.")

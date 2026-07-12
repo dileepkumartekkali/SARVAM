@@ -13,10 +13,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import statistics
 import time
 
 import httpx
+import jwt
 import websockets
 
 GATEWAY_WS_URL = "ws://localhost:8101/ws/stt"
@@ -93,11 +95,12 @@ async def run_chat_tier(tier: int, token: str, concurrency_cap: int) -> None:
     _report(tier, "chat_http", results, time.monotonic() - start)
 
 
-async def get_dev_token() -> str:
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(f"{BACKEND_URL}/auth/dev-login", json={"username": "load-test"})
-        resp.raise_for_status()
-        return resp.json()["access_token"]
+def get_dev_token() -> str:
+    # No server-side token-issuing route exists anymore (real auth is
+    # Supabase-issued JWTs) — mint one locally with the same shared secret
+    # the backend verifies against, exactly like the old /auth/dev-login did.
+    secret = os.environ.get("JWT_SIGNING_SECRET", "dev-preview-secret-not-for-prod")
+    return jwt.encode({"sub": "load-test", "exp": int(time.time()) + 3600}, secret, algorithm="HS256")
 
 
 async def main() -> None:
@@ -111,7 +114,7 @@ async def main() -> None:
         await run_stt_tier(tier, args.concurrency_cap)
 
     if not args.skip_chat:
-        token = await get_dev_token()
+        token = get_dev_token()
         for tier in args.tiers:
             await run_chat_tier(tier, token, args.concurrency_cap)
 

@@ -1,9 +1,25 @@
 import { useCallback, useRef } from "react";
 import { sendChatMessage, revealProgressively } from "../api/chatClient";
 import { MicCapture } from "../api/micCapture";
+import { supabase } from "../api/supabaseClient";
 import { TTSPlayer } from "../api/ttsPlayback";
 import { VoiceSocketClient } from "../api/voiceSocket";
 import { ConnectionState, Mode, VoiceState, useAppStore } from "../store/useAppStore";
+
+const TTS_AUDIO_BUCKET = "tts-audio";
+
+/** Uploads a finished TTS reply's audio so it can be replayed later, and
+ * attaches it to the message row (RLS-scoped update — same pattern as the
+ * upload path itself, no backend round-trip needed for either). Best-effort:
+ * a failed upload should never break the (already-played) voice reply. */
+async function saveReplyAudio({ userId, messageServerId, blob, onSaved }) {
+  if (!userId || !messageServerId || !blob) return;
+  const path = `${userId}/${messageServerId}.wav`;
+  const { error } = await supabase.storage.from(TTS_AUDIO_BUCKET).upload(path, blob, { contentType: "audio/wav" });
+  if (error) return;
+  await supabase.from("messages").update({ audio_path: path }).eq("id", messageServerId);
+  onSaved?.(messageServerId, path);
+}
 
 // THE one stop rule: 3 seconds of continuous silence ends listening —
 // whether the user never spoke at all, or spoke and then went quiet. Every
@@ -88,6 +104,9 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
   const appendToMessage = useAppStore((s) => s.appendToMessage);
   const finishMessage = useAppStore((s) => s.finishMessage);
   const setLanguageInfo = useAppStore((s) => s.setLanguageInfo);
+  const setMessageServerId = useAppStore((s) => s.setMessageServerId);
+  const setMessageAudioPath = useAppStore((s) => s.setMessageAudioPath);
+  const userId = useAppStore((s) => s.user?.id);
 
   const stopListening = useCallback(() => {
     clearTimeout(silenceTimerRef.current);
@@ -99,7 +118,7 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
     sttSocketRef.current = null;
   }, []);
 
-  const speakReply = useCallback(async (text, language) => {
+  const speakReply = useCallback(async (text, language, messageServerId) => {
     setVoiceState(VoiceState.SPEAKING);
     const player = (ttsPlayerRef.current ??= new TTSPlayer());
     await new Promise((resolve) => {
@@ -131,7 +150,10 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
       ws.addEventListener("error", resolve);
     });
     setVoiceState(VoiceState.IDLE);
-  }, [setVoiceState]);
+
+    const blob = player.finish();
+    saveReplyAudio({ userId, messageServerId, blob, onSaved: setMessageAudioPath }).catch(() => {});
+  }, [setVoiceState, userId, setMessageAudioPath]);
 
   const sendMessage = useCallback(
     async (text) => {
@@ -150,11 +172,12 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
           languageConfidence: result.language_confidence,
           isCodeMixed: result.is_code_mixed,
         });
+        if (result.message_id) setMessageServerId(assistantId, result.message_id);
         await revealProgressively(result.response, (chunk) => appendToMessage(assistantId, chunk));
         finishMessage(assistantId);
 
         if (mode === Mode.SPEECH_TO_SPEECH || mode === Mode.TEXT_TO_SPEECH) {
-          await speakReply(result.response, result.response_language);
+          await speakReply(result.response, result.response_language, result.message_id);
         } else {
           setVoiceState(VoiceState.IDLE);
         }
@@ -168,7 +191,19 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
         setVoiceState(VoiceState.IDLE);
       }
     },
-    [mode, token, ids, onUnauthorized, addMessage, appendToMessage, finishMessage, setLanguageInfo, setVoiceState, speakReply]
+    [
+      mode,
+      token,
+      ids,
+      onUnauthorized,
+      addMessage,
+      appendToMessage,
+      finishMessage,
+      setLanguageInfo,
+      setMessageServerId,
+      setVoiceState,
+      speakReply,
+    ]
   );
 
   const send = useCallback(

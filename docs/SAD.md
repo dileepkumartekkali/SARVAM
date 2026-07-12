@@ -151,12 +151,14 @@ risk:
   `require_role()`, the voice write-scope confirmation gate (code-level, not
   a prompt instruction), PII masking before logs, output sanitization,
   per-IP rate limiting, magic-byte audio validation, CORS allow-listing.
-- **Accepted risk, explicitly not solved**: no real OAuth IdP (only the
-  resource-server token-verification side exists, plus a `DEV_AUTH_ENABLED`-
-  gated dev-login endpoint for testability); no session-to-user ownership
-  check; rate limiter and confirmation gate are both single-process (a real
-  gap surfaced again by this SAD, see §3); CSRF not implemented (reasoned
-  low-priority for bearer-token auth, revisit if cookies are ever added).
+- **Real OAuth IdP**: Supabase (Google sign-in) issues the JWTs; the backend
+  is resource-server-only (`agent_core/security/auth.py` verifies, never
+  issues). Chat/audio persistence is scoped per-user via Postgres row
+  ownership (`agent_core/persistence/chat_store.py`) and Supabase Storage RLS.
+- **Accepted risk, explicitly not solved**: rate limiter and confirmation
+  gate are both single-process (a real gap surfaced again by this SAD, see
+  §3); CSRF not implemented (reasoned low-priority for bearer-token auth,
+  revisit if cookies are ever added).
 
 ## 5. Observability Architecture
 

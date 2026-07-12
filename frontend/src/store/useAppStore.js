@@ -55,10 +55,11 @@ export const ConnectionState = {
 let nextMessageId = 1;
 
 export const useAppStore = create((set, get) => ({
-  // --- Auth ---
+  // --- Auth --- (session comes from Supabase — see App.jsx)
   token: null,
-  setToken: (token) => set({ token }),
-  logout: () => set({ token: null }),
+  user: null, // {id, email, avatarUrl} or null
+  setSession: (token, user) => set({ token, user }),
+  logout: () => set({ token: null, user: null }),
 
   // --- Mode ---
   // Voice-first product: default to full voice conversation, not the
@@ -70,11 +71,17 @@ export const useAppStore = create((set, get) => ({
   connectionState: ConnectionState.CONNECTED,
   setConnectionState: (connectionState) => set({ connectionState }),
 
-  // --- Chat (text mode) ---
-  messages: [], // {id, role: "user"|"assistant", text, streaming}
-  addMessage: (role, text, { streaming = false } = {}) => {
+  // --- Chat ---
+  // {id, role: "user"|"assistant", text, streaming, serverId, audioPath}
+  // `id` is a local numeric counter for new messages (React key / append
+  // target) — `serverId` (the Postgres row's UUID, set once /chat responds)
+  // is what audio replay (Part 5) attaches an uploaded recording to. Loaded
+  // history rows use their server UUID directly as `id` (never collides
+  // with the small-integer local ids new messages get in the same session).
+  messages: [],
+  addMessage: (role, text, { streaming = false, serverId = null, audioPath = null } = {}) => {
     const id = nextMessageId++;
-    set((s) => ({ messages: [...s.messages, { id, role, text, streaming }] }));
+    set((s) => ({ messages: [...s.messages, { id, role, text, streaming, serverId, audioPath }] }));
     return id;
   },
   appendToMessage: (id, delta) =>
@@ -85,6 +92,27 @@ export const useAppStore = create((set, get) => ({
     set((s) => ({
       messages: s.messages.map((m) => (m.id === id ? { ...m, streaming: false } : m)),
     })),
+  setMessageServerId: (id, serverId) =>
+    set((s) => ({
+      messages: s.messages.map((m) => (m.id === id ? { ...m, serverId } : m)),
+    })),
+  setMessageAudioPath: (serverId, audioPath) =>
+    set((s) => ({
+      messages: s.messages.map((m) => (m.serverId === serverId ? { ...m, audioPath } : m)),
+    })),
+  // Rehydrates the chat box from the backend's persisted history — called
+  // once on login/mount, before any new message is added this session.
+  loadMessages: (rows) =>
+    set({
+      messages: rows.map((r) => ({
+        id: r.id,
+        role: r.role,
+        text: r.content,
+        streaming: false,
+        serverId: r.id,
+        audioPath: r.audio_path,
+      })),
+    }),
 
   // --- Language indicator ---
   responseLanguage: null,

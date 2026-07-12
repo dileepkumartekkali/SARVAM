@@ -39,6 +39,24 @@ export async function sendChatMessage({ message, mode, sessionId, conversationId
   return resp.json();
 }
 
+/** The authenticated user's persisted chat history (one ongoing conversation
+ * — see agent_core/persistence/chat_store.py) — fetched once on login/mount
+ * so a page refresh doesn't lose the visible chat log. */
+export async function fetchConversationHistory(token) {
+  const resp = await fetch(`${API_BASE_URL}/conversations/current/messages`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (resp.status === 401) {
+    const err = new Error("unauthorized");
+    err.status = 401;
+    throw err;
+  }
+  if (!resp.ok) {
+    throw new Error(`fetching chat history failed: ${resp.status}`);
+  }
+  return resp.json();
+}
+
 /** Reveals `text` into the store a few words at a time. Returns a promise
  * that resolves once the whole text has been appended. */
 export function revealProgressively(text, onChunk, { wordsPerTick = 3, tickMs = 40 } = {}) {
