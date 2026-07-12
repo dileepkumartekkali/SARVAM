@@ -3,7 +3,6 @@ import { isVoiceInputMode, Mode } from "../store/useAppStore";
 import VoiceOrb from "./VoiceOrb";
 
 const MODE_OPTIONS = [
-  { value: Mode.TEXT_TO_TEXT, label: "Text" },
   { value: Mode.SPEECH_TO_TEXT, label: "Speech to Text" },
   { value: Mode.TEXT_TO_SPEECH, label: "Text to Speech" },
   { value: Mode.SPEECH_TO_SPEECH, label: "Speech to Speech" },

@@ -124,10 +124,21 @@
 
 .chat-view__empty {
   margin: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-3);
   color: var(--text-secondary);
   font-size: var(--font-size-md);
   text-align: center;
   max-width: 28ch;
+}
+.chat-view__empty svg {
+  color: var(--accent-400);
+  opacity: 0.7;
+}
+.chat-view__empty p {
+  margin: 0;
 }
 
 .message-row {
@@ -212,22 +223,25 @@
 }
 
 .composer__mode-switch {
-  display: inline-flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
   background: var(--border-subtle);
   border-radius: var(--radius-full);
   padding: 3px;
-  margin-bottom: var(--space-2);
+  margin-bottom: var(--space-3);
 }
 
 .composer__mode-btn {
   border: none;
   background: transparent;
-  padding: 5px var(--space-3);
+  padding: var(--space-2) var(--space-3);
   border-radius: var(--radius-full);
-  font-size: var(--font-size-xs);
+  font-size: var(--font-size-sm);
   color: var(--text-secondary);
   cursor: pointer;
+  min-height: 40px;
+  text-align: center;
+  transition: background 0.15s ease, color 0.15s ease;
 }
 .composer__mode-btn--active {
   background: var(--surface-raised);
@@ -281,7 +295,7 @@
 .composer__voice {
   display: flex;
   justify-content: center;
-  padding: var(--space-3) 0;
+  padding: var(--space-4) 0;
 }
 
 /* ---------- Voice orb (mic button state machine) ---------- */
@@ -289,12 +303,12 @@
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: var(--space-2);
+  gap: var(--space-3);
 }
 
 .voice-orb {
-  width: 72px;
-  height: 72px;
+  width: 84px;
+  height: 84px;
   border-radius: 50%;
   border: none;
   display: flex;
@@ -302,30 +316,40 @@
   justify-content: center;
   cursor: pointer;
   color: #fff;
-  background: var(--ink-500);
-  box-shadow: var(--shadow-2);
-  transition: background 0.2s ease, transform 0.15s ease;
+  background: linear-gradient(160deg, var(--ink-500), var(--ink-700));
+  box-shadow: var(--shadow-3);
+  transition: background 0.2s ease, transform 0.15s ease, box-shadow 0.2s ease;
   position: relative;
 }
 .voice-orb:active {
   transform: scale(0.96);
 }
+.voice-orb:hover {
+  box-shadow: var(--shadow-3), 0 0 0 6px var(--border-subtle);
+}
 
 .voice-orb--idle {
-  background: var(--ink-500);
+  background: linear-gradient(160deg, var(--ink-500), var(--ink-700));
+}
+
+@media (min-width: 768px) {
+  .voice-orb {
+    width: 96px;
+    height: 96px;
+  }
 }
 
 .voice-orb--listening {
-  background: var(--listening);
+  background: linear-gradient(160deg, var(--listening), #227a54);
   animation: pulse-ring 1.6s cubic-bezier(0.4, 0, 0.6, 1) infinite;
 }
 
 .voice-orb--processing {
-  background: var(--accent-500);
+  background: linear-gradient(160deg, var(--accent-500), var(--accent-600));
 }
 
 .voice-orb--speaking {
-  background: var(--speaking);
+  background: linear-gradient(160deg, var(--speaking), #2c5fa8);
 }
 
 .voice-orb--flash::after {
@@ -370,7 +394,8 @@
 }
 
 .voice-orb__label {
-  font-size: var(--font-size-sm);
+  font-size: var(--font-size-md);
+  font-weight: 500;
   color: var(--text-secondary);
 }
 

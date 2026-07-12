@@ -61,7 +61,9 @@ export const useAppStore = create((set, get) => ({
   logout: () => set({ token: null }),
 
   // --- Mode ---
-  mode: Mode.TEXT_TO_TEXT,
+  // Voice-first product: default to full voice conversation, not the
+  // (now-removed) type-and-read text mode.
+  mode: Mode.SPEECH_TO_SPEECH,
   setMode: (mode) => set({ mode }),
 
   // --- Connection (backend REST / speech gateway WS) ---
