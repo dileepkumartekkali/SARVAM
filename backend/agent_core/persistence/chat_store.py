@@ -29,7 +29,11 @@ async def _get_pool() -> asyncpg.Pool | None:
     if not dsn:
         return None
     if _pool is None or _pool_dsn != dsn:
-        _pool = await asyncpg.create_pool(dsn, min_size=1, max_size=5)
+        # Supabase's connection pooler (PgBouncer, transaction mode) doesn't
+        # support server-side prepared statements the way asyncpg uses by
+        # default -- every query fails with a "prepared statement ... does
+        # not exist"/duplicate error. statement_cache_size=0 turns that off.
+        _pool = await asyncpg.create_pool(dsn, min_size=1, max_size=5, statement_cache_size=0)
         _pool_dsn = dsn
     return _pool
 
