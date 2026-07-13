@@ -7,6 +7,7 @@ WebSocket routes live in the Speech Gateway (its own service).
 from __future__ import annotations
 
 import os
+from contextlib import asynccontextmanager
 from typing import Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Response
@@ -26,7 +27,18 @@ from ..tools import build_default_registry
 configure_logging()
 init_tracing("backend")
 
-app = FastAPI(title="MAAV / Mvoice backend", version="0.1.0")
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    # Pays the Postgres connection-pool setup cost once at boot instead of on
+    # whichever user's request happens to be first after a cold start (Render
+    # free tier idles the whole process) — a real, measured chunk of the
+    # "first load after refresh is slow" latency.
+    await chat_store.warm_up()
+    yield
+
+
+app = FastAPI(title="MAAV / Mvoice backend", version="0.1.0", lifespan=_lifespan)
 
 # Explicit allow-list only — no wildcard-with-credentials, which browsers
 # treat as a CORS misconfiguration anyway. Empty by default (deny all
@@ -231,3 +243,14 @@ async def get_conversation_messages(
         )
         for r in rows
     ]
+
+
+@app.delete("/conversations/{conversation_id}", status_code=204)
+async def delete_conversation(conversation_id: str, principal: Principal = Depends(get_current_principal)) -> None:
+    """Deletes the conversation and (via the schema's `on delete cascade`)
+    every message in it. Does not delete any replay audio already uploaded
+    to Supabase Storage for those messages -- out of scope here."""
+    if not chat_store.is_configured():
+        raise HTTPException(status_code=503, detail="persistence not configured")
+    if not await chat_store.delete_conversation(conversation_id, principal.subject):
+        raise HTTPException(status_code=404, detail="conversation not found")

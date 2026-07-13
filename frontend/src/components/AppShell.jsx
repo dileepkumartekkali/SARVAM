@@ -15,6 +15,7 @@ export default function AppShell({
   activeConversationId,
   onSwitchConversation,
   onNewConversation,
+  onDeleteConversation,
   onOpenConversations,
   children,
 }) {
@@ -50,6 +51,7 @@ export default function AppShell({
         activeConversationId={activeConversationId}
         onSwitchConversation={onSwitchConversation}
         onNewConversation={onNewConversation}
+        onDeleteConversation={onDeleteConversation}
       />
     </div>
   );

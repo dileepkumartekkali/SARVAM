@@ -88,6 +88,18 @@ export async function fetchConversationMessages(token, conversationId) {
   return resp.json();
 }
 
+/** Deletes a conversation and everything in it (cascades server-side —
+ * see chat_store.delete_conversation). Does not remove any replay audio
+ * already uploaded to Supabase Storage for it. */
+export async function deleteConversation(token, conversationId) {
+  const resp = await fetch(`${API_BASE_URL}/conversations/${conversationId}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const err = _unauthorizedOr(resp, "deleting conversation failed");
+  if (err) throw err;
+}
+
 /** Reveals `text` into the store a few words at a time. Returns a promise
  * that resolves once the whole text has been appended. */
 export function revealProgressively(text, onChunk, { wordsPerTick = 3, tickMs = 40 } = {}) {

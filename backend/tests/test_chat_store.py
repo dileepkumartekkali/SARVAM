@@ -61,7 +61,15 @@ class _FakeConnection:
         if query.startswith("update conversations set updated_at"):
             (conversation_id,) = args
             self._conversations[conversation_id]["updated_at"] = datetime.datetime.now(datetime.timezone.utc)
-            return
+            return "UPDATE 1"
+        if query.startswith("delete from conversations"):
+            conversation_id, user_id = args
+            row = self._conversations.get(conversation_id)
+            if row is None or row["user_id"] != user_id:
+                return "DELETE 0"
+            del self._conversations[conversation_id]
+            self._messages[:] = [m for m in self._messages if m["conversation_id"] != conversation_id]
+            return "DELETE 1"
         raise AssertionError(f"unexpected execute: {query}")
 
 
@@ -165,3 +173,29 @@ async def test_messages_are_scoped_to_owning_user(fake_pool):
     # this is the ownership check that matters since the backend's own
     # connection bypasses RLS (trusted server-side query, not PostgREST).
     assert await chat_store.list_messages(alice_conversation, bob) == []
+
+
+async def test_delete_conversation_removes_it_and_its_messages(fake_pool):
+    user_id = str(uuid.uuid4())
+    conversation_id = await chat_store.create_conversation(user_id)
+    await chat_store.insert_message(conversation_id, user_id, "user", "hello")
+
+    assert await chat_store.delete_conversation(conversation_id, user_id) is True
+
+    assert await chat_store.get_conversation(conversation_id, user_id) is None
+    assert await chat_store.list_messages(conversation_id, user_id) == []
+
+
+async def test_delete_conversation_rejects_non_owner(fake_pool):
+    alice = str(uuid.uuid4())
+    bob = str(uuid.uuid4())
+    conversation_id = await chat_store.create_conversation(alice)
+
+    assert await chat_store.delete_conversation(conversation_id, bob) is False
+    # Untouched -- still there for the actual owner.
+    assert await chat_store.get_conversation(conversation_id, alice) is not None
+
+
+async def test_warm_up_is_a_no_op_without_a_dsn(monkeypatch):
+    monkeypatch.delenv("POSTGRES_DSN", raising=False)
+    await chat_store.warm_up()  # must not raise

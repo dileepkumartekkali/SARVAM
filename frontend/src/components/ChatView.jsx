@@ -1,7 +1,7 @@
 import { useEffect, useRef } from "react";
 import MessageBubble from "./MessageBubble";
 
-export default function ChatView({ messages }) {
+export default function ChatView({ messages, loading }) {
   const bottomRef = useRef(null);
 
   useEffect(() => {
@@ -10,7 +10,13 @@ export default function ChatView({ messages }) {
 
   return (
     <div className="chat-view">
-      {messages.length === 0 && (
+      {messages.length === 0 && loading && (
+        <div className="chat-view__empty">
+          <span className="chat-view__spinner" aria-hidden="true" />
+          <p>Loading your conversation…</p>
+        </div>
+      )}
+      {messages.length === 0 && !loading && (
         <div className="chat-view__empty">
           <svg viewBox="0 0 24 24" width="36" height="36" aria-hidden="true">
             <path

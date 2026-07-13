@@ -47,6 +47,30 @@ async def _get_pool() -> asyncpg.Pool | None:
     return _pool
 
 
+async def warm_up() -> None:
+    """Pre-creates the connection pool at app startup instead of paying that
+    connect cost on a user's very first request after a cold start (Render
+    free-tier idles the whole process, not just the DB connection)."""
+    await _get_pool()
+
+
+async def delete_conversation(conversation_id: str, user_id: str) -> bool:
+    """Ownership-scoped delete — `messages` rows cascade-delete via the FK
+    (schema: `on delete cascade`), no separate cleanup needed. Returns
+    whether a row was actually deleted (false = didn't exist or wasn't
+    yours; the caller reports both as 404, never which)."""
+    pool = await _get_pool()
+    if pool is None:
+        return False
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "delete from conversations where id = $1 and user_id = $2",
+            uuid.UUID(conversation_id),
+            uuid.UUID(user_id),
+        )
+        return result == "DELETE 1"
+
+
 async def list_conversations(user_id: str) -> list[dict]:
     """Returns `[]` (no-op) when persistence isn't configured. Ordered most-
     recently-active first; `title` is derived from the first message (no

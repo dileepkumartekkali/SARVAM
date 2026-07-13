@@ -3,7 +3,7 @@ import AppShell from "./components/AppShell";
 import ChatView from "./components/ChatView";
 import Composer from "./components/Composer";
 import LoginScreen from "./components/LoginScreen";
-import { createConversation, fetchConversationMessages, listConversations } from "./api/chatClient";
+import { createConversation, deleteConversation, fetchConversationMessages, listConversations } from "./api/chatClient";
 import { supabase } from "./api/supabaseClient";
 import { useVoiceSession } from "./hooks/useVoiceSession";
 import { selectIsAuthenticated, useAppStore } from "./store/useAppStore";
@@ -159,6 +159,42 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token, conversations, loadMessages]);
 
+  const handleDeleteConversation = useCallback(
+    async (id) => {
+      try {
+        await deleteConversation(token, id);
+      } catch {
+        return; // best-effort -- leave the list as-is if the delete itself failed
+      }
+      const remaining = conversations.filter((c) => c.id !== id);
+      setConversations(remaining);
+      if (id !== activeConversationId) return; // deleted a chat that wasn't open -- nothing else to do
+
+      if (remaining.length > 0) {
+        activateConversation(remaining[0].id);
+        try {
+          loadMessages(await fetchConversationMessages(token, remaining[0].id));
+        } catch {
+          loadMessages([]);
+        }
+        return;
+      }
+      // Deleted the only conversation -- start a fresh one so there's always
+      // something to chat in, same as a brand-new user's first load.
+      try {
+        const created = await createConversation(token);
+        setConversations([{ id: created.id, title: null, updated_at: new Date().toISOString() }]);
+        activateConversation(created.id);
+        loadMessages([]);
+      } catch {
+        // Persistence hiccup right after a delete — rare; the composer will
+        // still point at the now-deleted id until the user reloads.
+      }
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [token, conversations, activeConversationId, setConversations, loadMessages]
+  );
+
   // Sidebar titles/ordering only need to be fresh when it's actually opened,
   // not after every single turn — cheap, and avoids an extra request per
   // message for a purely cosmetic refresh.
@@ -194,9 +230,10 @@ export default function App() {
       activeConversationId={activeConversationId}
       onSwitchConversation={handleSwitchConversation}
       onNewConversation={handleNewConversation}
+      onDeleteConversation={handleDeleteConversation}
       onOpenConversations={handleRefreshConversations}
     >
-      <ChatView messages={messages} />
+      <ChatView messages={messages} loading={!conversationReady} />
       <Composer
         mode={mode}
         onModeChange={setMode}
