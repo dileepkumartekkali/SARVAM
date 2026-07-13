@@ -116,7 +116,33 @@ The backend never issues tokens itself — it only verifies JWTs an IdP signed
 the Supabase project's JWT secret, `JWT_AUDIENCE=authenticated` matches the
 `aud` claim Supabase stamps into every token.
 
-### 4. Agentic tool-calling loop
+### 4. Persistent chat history, multi-conversation switching, audio replay
+
+```
+Client -> GET /conversations                       -> list, most-recently-active first
+Client -> POST /conversations                       -> {id}  (start a new chat)
+Client -> GET /conversations/{id}/messages          -> full history for that chat
+Client -> POST /chat {conversation_id, thread_id, ...} -> conversation_id must be owned
+                                                          by the caller (404 otherwise);
+                                                          thread_id == conversation_id, so
+                                                          LangGraph's own short-term memory
+                                                          is isolated per conversation too
+```
+
+Backed by `agent_core/persistence/chat_store.py` — a dedicated Postgres table
+(Supabase), separate from LangGraph's `MemorySaver` checkpointer (which stays
+capped/pruned for prompt-size reasons, see `_MAX_HISTORY_MESSAGES`). Every
+query is scoped by `user_id`, so one user's conversations are never visible
+to another. Entirely optional at runtime: no `POSTGRES_DSN` means no
+persistence (every `/chat` call still works statelessly), so local dev/CI
+needs no database. Schema: `docs/supabase_schema.sql`.
+
+TTS/STS replies are captured client-side (decoded PCM, re-encoded to one WAV
+per turn — `frontend/src/api/ttsPlayback.js`) and uploaded to Supabase
+Storage so a message's voice reply can be played again later, not just once
+live (`frontend/src/components/MessageBubble.jsx`'s Play button).
+
+### 5. Agentic tool-calling loop
 
 ```
 User: "What's 17 times 23, and remind me to call mom?"
@@ -145,28 +171,30 @@ gate, not a prompt instruction. See `test_agentic_loop_real_tools.py` and
 ```
 backend/
   agent_core/
-    api/             FastAPI backend: POST /chat, POST /auth/dev-login, GET /health, GET /metrics
+    api/             FastAPI backend: POST /chat, GET/POST /conversations, GET /health, GET /metrics
     agents/           language_agent (detection), task_agent (reasoning loop), cancellation, untrusted
     llm_adapter/      LLMProvider adapters (Grok/GPT/Sarvam/Claude/Gemini) + fallback router
+    persistence/      chat_store.py — Postgres-backed conversation/message history (Supabase)
     tools/            real tools (registry.py, builtin.py) + system-prompt manifest generation
     speech/           Sarvam STT/TTS clients, response chunker, audio validation, TTS provider policy
     speech_gateway/   its own FastAPI app (own Dockerfile/container) — the only thing that
                       talks to Sarvam/Azure: /ws/stt, /ws/tts, DuplexSession (barge-in)
     supervisor/       SessionState, session state machine, the LangGraph itself
-    security/         JWT auth/RBAC, PII masking, output sanitization, rate limiting,
-                      voice write-scope confirmation gate, data-retention gate
+    security/         JWT auth (Supabase-issued, HS256 or JWKS/ES256)/RBAC, PII masking, output
+                      sanitization, rate limiting, voice write-scope confirmation gate
     observability/    structured JSON logging, OpenTelemetry tracing, Prometheus metrics
   scripts/            run_dev_server.py (local dev), load_test.py, chaos_test.py — see below
-  tests/              243 tests (230 pass unconditionally, 13 skip unless a real LLM key + a flag are set)
+  tests/              280+ tests (unconditional pass, 13 skip unless a real LLM key + a flag are set)
   prompts/            versioned system-prompt template files (text_mode / voice_mode) — lives
                       inside backend/ (not the repo root) so it's always inside the Docker
                       build context, whatever directory a deployment roots its build at
   Dockerfile, Dockerfile.gateway   multi-stage builds, one per service
 frontend/
   src/
-    api/              backend/gateway HTTP+WS clients
-    components/       chat UI, voice orb (state-machine visual), login, language badge
-    hooks/            useVoiceSession (STT WS + visual state machine)
+    api/              backend/gateway HTTP+WS clients, supabaseClient.js (auth/storage)
+    components/       chat UI, voice orb (state-machine visual), login (Google OAuth),
+                      language badge, ConversationDrawer (chat switcher), ProfileMenu
+    hooks/            useVoiceSession (STT WS + visual state machine, TTS reply capture/upload)
     store/            Zustand store — see its file header for why Zustand, not Redux/Context
 infra/
   k8s/                blue-green (backend) + canary-with-connection-draining (gateway) manifests
@@ -180,11 +208,14 @@ docs/                 see the index below
 
 ```bash
 # Backend — real code, but /chat needs at least one LLM provider key to
-# actually answer (falls through LLM_PROVIDER_ORDER; e.g. GROK_API_KEY).
+# actually answer (falls through LLM_PROVIDER_ORDER; e.g. GROK_API_KEY), and
+# a real Supabase-issued JWT to authenticate (see Auth flow above — the
+# backend only verifies tokens, it doesn't issue them, so there's no local
+# dev-login shortcut anymore).
 cd backend
 pip install -e ".[dev]"
-python scripts/run_dev_server.py     # :8000 — dev auth pre-enabled for local testing
-pytest                                # 230 passed, 13 skipped
+python scripts/run_dev_server.py     # :8000
+pytest                                # 280+ passed, 13 skipped
 
 # Speech Gateway — needs SARVAM_API_KEY (and AZURE_SPEECH_KEY/_REGION for
 # the Assamese/Urdu fallback) to actually reach Sarvam/Azure.
@@ -197,11 +228,12 @@ npm run dev                           # :5173
 ```
 
 ```bash
-# A real turn, once a provider key is set:
+# A real turn, once a provider key + a Supabase project are set up (sign in
+# via the frontend to get a real access_token, or mint a matching HS256 test
+# token locally with JWT_SIGNING_SECRET for a quick curl check):
 curl -X POST localhost:8000/chat -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $(curl -s -X POST localhost:8000/auth/dev-login \
-        -H 'Content-Type: application/json' -d '{"username":"me"}' | jq -r .access_token)" \
-  -d '{"session_id":"s1","conversation_id":"c1","thread_id":"t1","message":"What is 17 times 23?"}'
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -d '{"session_id":"s1","conversation_id":"c1","thread_id":"c1","message":"What is 17 times 23?"}'
 ```
 
 ```bash
@@ -263,6 +295,9 @@ breakdown of what's mitigated vs. accepted risk: `docs/THREAT_MODEL.md`.
 - [`docs/agent_system_prompt.md`](docs/agent_system_prompt.md) /
   [`docs/speech_to_speech_implementation_plan.md`](docs/speech_to_speech_implementation_plan.md) —
   the binding specs the code is built against.
+- [`docs/supabase_schema.sql`](docs/supabase_schema.sql) — the conversations/
+  messages tables + RLS policies + Storage bucket policy, run once in the
+  Supabase project's SQL Editor.
 
 ## Known gaps
 
@@ -273,28 +308,38 @@ its own docs say so too.
    conversation.** The two capabilities are independently real; the
    orchestration (and `DuplexSession`'s live barge-in) is not wired into an
    actual endpoint. This is the top functional gap.
-2. **Postgres-backed checkpointer is undeployed and unvalidated under
-   chaos.** `MemorySaver` (in-memory) is the current default; a real backend
-   process death would lose all in-flight conversation state. No
-   Docker/Postgres available in this environment to test the prod path.
+2. **LangGraph's own reasoning checkpointer (`MemorySaver`) is still
+   in-memory, not Postgres-backed** — a real backend process death loses the
+   agent's short-term working context (the model's last few turns of
+   context for THIS reasoning session). This is distinct from user-facing
+   chat history, which now **is** durable (`agent_core/persistence/
+   chat_store.py`, Supabase Postgres) — a restart loses the agent's
+   scratch-context, not the conversation the user sees.
 3. **Rate limiter and the voice confirmation gate are both single-process.**
    Neither is shared across replicas — a real gap for any multi-replica
    deployment.
-4. **No real OAuth identity provider** — only the resource-server
-   token-verification side, plus a dev-only login endpoint.
-5. **Tool-calling is a placeholder text convention**
+4. **Tool-calling is a placeholder text convention**
    (`TOOL_CALL: {...}` in the model's reply), not a provider's native
    function-calling API. `agent_core/tools/` itself is real; the *wire
    format* between model and loop is the still-placeholder part.
-6. **CI/CD, Docker, and Terraform are written but unexecuted** — this repo
+5. **CI/CD, Docker, and Terraform are written but unexecuted** — this repo
    had no git history before its production-readiness pass; no GitHub
    remote, Docker, or Terraform CLI exists in this development environment.
-7. **Sarvam's real rate/concurrency ceiling is unknown** — not published in
+6. **Sarvam's real rate/concurrency ceiling is unknown** — not published in
    the docs consulted, and no live account exists here to measure it.
    Confirm directly with Sarvam before finalizing gateway autoscaling
    targets.
-8. **Cross-service distributed tracing isn't linked** — spans are correct
+7. **Cross-service distributed tracing isn't linked** — spans are correct
    *within* each service; W3C trace-context propagation between the gateway
    and backend isn't wired.
+8. **Grok (Groq-hosted Llama 3.3 70B) is not officially multilingual across
+   all 13 Indic languages** — Meta's published support list for Llama 3.3
+   covers English/French/German/Hindi/Italian/Portuguese/Spanish/Thai, not
+   Telugu/Tamil/Kannada/Malayalam/Marathi/Gujarati/Punjabi/Bengali/Odia/
+   Assamese/Urdu. Sarvam (purpose-built for all 13 + code-mixing) is the
+   primary LLM provider precisely because of this gap; Grok is only reached
+   if Sarvam's own LLM call fails, so this risk is rare in practice but real
+   — a Sarvam outage could produce a lower-quality or English-language reply
+   to a non-Hindi Indic-language question until Sarvam recovers.
 
 # SARVAM
