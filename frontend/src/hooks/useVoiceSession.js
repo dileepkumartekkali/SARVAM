@@ -21,14 +21,15 @@ async function saveReplyAudio({ userId, messageServerId, blob, onSaved }) {
   onSaved?.(messageServerId, path);
 }
 
-// THE one stop rule: 2.5 seconds of continuous silence ends listening —
+// THE one stop rule: 2 seconds of continuous silence ends listening —
 // whether the user never spoke at all, or spoke and then went quiet. Every
 // voiced frame resets this timer. Deliberately NOT stopping on Sarvam's
 // per-segment `speech_end` anymore: that fires on brief mid-sentence pauses
 // too, and cutting there ends the question early. Instead, transcript
 // segments ACCUMULATE across pauses and everything said gets joined into
-// one question when the 2.5s of real silence finally lands.
-const SILENCE_STOP_MS = 2500;
+// one question when the 2s of real silence finally lands. Applies uniformly
+// to Speech-to-Text and Speech-to-Speech — both run through this same hook.
+const SILENCE_STOP_MS = 2000;
 
 // After the 3s silence stop, the LAST speech segment's transcript may still
 // be in flight from Sarvam (it follows speech_end by up to ~1-2s). The
@@ -96,6 +97,12 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
   const silenceTimerRef = useRef(null);
   const graceTimerRef = useRef(null);
   const maxListenTimerRef = useRef(null);
+  // Points at the active listening session's `conclude()` (defined inside
+  // `startListening`) so a manual second tap can trigger the exact same
+  // "finalize whatever was said" path the silence timeout uses, instead of
+  // the raw teardown `stopListening()` below (which discards the transcript
+  // — see `toggle()`). `null` whenever nothing is listening.
+  const concludeRef = useRef(null);
 
   const mode = useAppStore((s) => s.mode);
   const setVoiceState = useAppStore((s) => s.setVoiceState);
@@ -116,6 +123,7 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
     micRef.current = null;
     sttSocketRef.current?.closeSTT();
     sttSocketRef.current = null;
+    concludeRef.current = null;
   }, []);
 
   const speakReply = useCallback(async (text, language, messageServerId) => {
@@ -286,6 +294,7 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
       // flight — hold the socket open briefly so it isn't dropped.
       graceTimerRef.current = setTimeout(finalize, FINAL_TRANSCRIPT_GRACE_MS);
     };
+    concludeRef.current = conclude; // exposes this session's conclude() to toggle()'s manual-stop path
 
     const resetSilenceTimer = () => {
       clearTimeout(silenceTimerRef.current);
@@ -394,7 +403,7 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
       return;
     }
 
-    // The ONE stop rule starts counting from here: 2.5s of silence — whether
+    // The ONE stop rule starts counting from here: 2s of silence — whether
     // the user never speaks (mic stops, nothing was ever sent anywhere) or
     // speaks and then goes quiet (their whole question is finalized).
     resetSilenceTimer();
@@ -413,6 +422,12 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
       // user-gesture context is lost the moment the call stack goes async.
       const audioCtx = new AudioContext();
       startListening(audioCtx);
+    } else if (concludeRef.current) {
+      // Tapping again while listening means "I'm done talking, process what
+      // I said" — not "throw it away." Previously this called the raw
+      // stopListening() (tears down mic+socket with no finalize), silently
+      // discarding whatever had already been transcribed instead of sending it.
+      concludeRef.current();
     } else {
       stopListening();
       setVoiceState(VoiceState.IDLE);

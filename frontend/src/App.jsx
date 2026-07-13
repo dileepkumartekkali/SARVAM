@@ -110,14 +110,18 @@ export default function App() {
     (async () => {
       try {
         let list = await listConversations(token);
+        let isBrandNew = false;
         if (list.length === 0) {
           const created = await createConversation(token);
           list = [{ id: created.id, title: null, updated_at: new Date().toISOString() }];
+          isBrandNew = true;
         }
         setConversations(list);
         activateConversation(list[0].id);
-        const history = await fetchConversationMessages(token, list[0].id);
-        loadMessages(history);
+        // A conversation we just created has no messages -- fetching them
+        // is a pointless extra round-trip that only made the loading spinner
+        // last longer for a first-time user, for a result we already know.
+        loadMessages(isBrandNew ? [] : await fetchConversationMessages(token, list[0].id));
         setConversationReady(true);
       } catch (err) {
         if (err.status === 401) {
