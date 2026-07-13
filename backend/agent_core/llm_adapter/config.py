@@ -26,10 +26,19 @@ _DEFAULT_ORDER = "grok,sarvam,gemini,claude,gpt"
 
 def _build_provider(name: str) -> LLMProvider:
     if name == "grok":
+        # Real bug hit live: this provider is Groq (api.groq.com, hosting
+        # Llama models) -- every comment in this codebase and .env.example
+        # say so -- but the default base_url/model pointed at xAI's actual
+        # Grok API (api.x.ai) instead. A real Groq API key was being sent to
+        # the wrong company's endpoint, rejected as "Incorrect API key
+        # provided" (a genuine-looking auth error, not a hint at the real
+        # cause). Kept the "grok" name (env var GROK_API_KEY, provider
+        # registry key) unchanged -- only the wrong DEFAULT endpoint/model
+        # were the bug, not the naming.
         return OpenAICompatibleProvider(
             name="grok",
-            base_url=os.environ.get("GROK_BASE_URL", "https://api.x.ai/v1"),
-            model=os.environ.get("GROK_MODEL", "grok-4"),
+            base_url=os.environ.get("GROK_BASE_URL", "https://api.groq.com/openai/v1"),
+            model=os.environ.get("GROK_MODEL", "llama-3.3-70b-versatile"),
             api_key_env="GROK_API_KEY",
         )
     if name == "gpt":
