@@ -85,3 +85,53 @@ def test_audience_mismatch_rejected(monkeypatch):
 
     with pytest.raises(AuthError):
         decode_token(token, AuthConfig(audience="expected-audience"))
+
+
+def test_supabase_jwks_verified_token_decodes_to_principal(monkeypatch):
+    """Supabase's current default: JWTs are signed asymmetrically (ES256),
+    not with the shared HS256 secret — verified live against a real project
+    (a real access token's header carried `alg: ES256`). Mocks the JWKS fetch
+    (no network in tests) but exercises the real ES256 verify path."""
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    import agent_core.security.auth as auth_module
+
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    token = jwt.encode(
+        {"sub": "supabase-user-1", "exp": int(time.time()) + 3600, "aud": "authenticated"},
+        private_key,
+        algorithm="ES256",
+        headers={"kid": "test-kid"},
+    )
+
+    class _FakeSigningKey:
+        key = private_key.public_key()
+
+    class _FakeJWKClient:
+        def get_signing_key_from_jwt(self, _token):
+            return _FakeSigningKey()
+
+    monkeypatch.setenv("SUPABASE_URL", "https://fake-project.supabase.co")
+    auth_module._jwks_client.cache_clear()
+    monkeypatch.setattr(auth_module, "_jwks_client", lambda url: _FakeJWKClient())
+
+    principal = decode_token(token, AuthConfig(audience="authenticated"))
+
+    assert principal.subject == "supabase-user-1"
+
+
+def test_unreachable_jwks_is_a_clean_500(monkeypatch):
+    monkeypatch.setenv("SUPABASE_URL", "https://fake-project.supabase.co")
+
+    import agent_core.security.auth as auth_module
+
+    def _raise(_url):
+        raise jwt.PyJWKClientError("could not fetch JWKS")
+
+    auth_module._jwks_client.cache_clear()
+    monkeypatch.setattr(auth_module, "_jwks_client", _raise)
+
+    with pytest.raises(AuthError) as exc_info:
+        decode_token(_make_token())
+
+    assert exc_info.value.status_code == 500

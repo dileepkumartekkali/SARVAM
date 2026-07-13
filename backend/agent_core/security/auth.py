@@ -12,6 +12,7 @@ vars, never this file.
 
 from __future__ import annotations
 
+import functools
 import os
 from dataclasses import dataclass, field
 
@@ -20,6 +21,14 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 _bearer_scheme = HTTPBearer(auto_error=False)
+
+
+@functools.lru_cache(maxsize=8)
+def _jwks_client(jwks_url: str) -> jwt.PyJWKClient:
+    # PyJWKClient fetches + caches the provider's public keys itself (keyed
+    # by `kid`) — one client per URL is all that's needed, reused across
+    # requests rather than re-fetched every time.
+    return jwt.PyJWKClient(jwks_url)
 
 
 @dataclass
@@ -52,27 +61,49 @@ class Principal:
         return role in self.roles
 
 
+def _resolve_jwks_url() -> str | None:
+    """Supabase's current default: JWTs are signed asymmetrically (ES256, a
+    per-project key pair) rather than with a shared HS256 secret — verified
+    live (a real access token's header carried `alg: ES256`). `SUPABASE_URL`
+    is enough to derive the well-known JWKS endpoint; `JWT_SIGNING_SECRET`
+    stays as the fallback for IdPs that still use a shared HS256 secret."""
+    explicit = os.environ.get("SUPABASE_JWKS_URL")
+    if explicit:
+        return explicit
+    supabase_url = os.environ.get("SUPABASE_URL")
+    return f"{supabase_url.rstrip('/')}/auth/v1/.well-known/jwks.json" if supabase_url else None
+
+
 def decode_token(token: str, config: AuthConfig | None = None) -> Principal:
     cfg = config or AuthConfig()
+    jwks_url = _resolve_jwks_url()
     try:
-        secret = cfg.secret()
-    except RuntimeError as e:
-        # A real bug hit in production: a missing JWT_SIGNING_SECRET raised
-        # here, uncaught, as a bare RuntimeError — every authenticated
-        # request (including /chat) crashed with an unhandled-exception 500
-        # and no diagnosable message. This is a server misconfiguration, not
-        # a client auth failure, so it stays a 500 — but now with a message
-        # that actually says what's missing, in logs and the response body.
+        if jwks_url:
+            signing_key = _jwks_client(jwks_url).get_signing_key_from_jwt(token).key
+            claims = jwt.decode(
+                token,
+                signing_key,
+                algorithms=["ES256", "RS256"],
+                audience=cfg.audience,
+                issuer=cfg.issuer,
+                options={"require": ["exp", "sub"], "verify_aud": cfg.audience is not None},
+            )
+        else:
+            claims = jwt.decode(
+                token,
+                cfg.secret(),
+                algorithms=[cfg.algorithm],
+                audience=cfg.audience,
+                issuer=cfg.issuer,
+                options={"require": ["exp", "sub"], "verify_aud": cfg.audience is not None},
+            )
+    except (RuntimeError, jwt.PyJWKClientError) as e:
+        # A missing secret/unreachable JWKS endpoint is a server
+        # misconfiguration, not a client auth failure — a real bug hit in
+        # production once already for the missing-secret case (bare
+        # RuntimeError, uncaught, every authenticated request 500'd with no
+        # diagnosable message), so both stay a clean 500 with a real reason.
         raise AuthError(f"server misconfigured: {e}", status_code=status.HTTP_500_INTERNAL_SERVER_ERROR) from e
-    try:
-        claims = jwt.decode(
-            token,
-            secret,
-            algorithms=[cfg.algorithm],
-            audience=cfg.audience,
-            issuer=cfg.issuer,
-            options={"require": ["exp", "sub"], "verify_aud": cfg.audience is not None},
-        )
     except jwt.ExpiredSignatureError as e:
         raise AuthError("token expired") from e
     except jwt.InvalidTokenError as e:
