@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 from typing import Literal
 
-from fastapi import Depends, FastAPI, Response
+from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -134,8 +134,11 @@ async def chat(
         thread_id=req.thread_id,
         mode=Mode(req.mode),
     )
-    conversation_id = await chat_store.get_or_create_conversation(principal.subject)
-    if conversation_id is not None:
+    conversation_id = None
+    if chat_store.is_configured():
+        if await chat_store.get_conversation(req.conversation_id, principal.subject) is None:
+            raise HTTPException(status_code=404, detail="conversation not found")
+        conversation_id = req.conversation_id
         await chat_store.insert_message(conversation_id, principal.subject, "user", req.message)
 
     result = await graph.ainvoke(
@@ -181,15 +184,42 @@ class StoredMessage(BaseModel):
     response_language: str | None
 
 
-@app.get("/conversations/current/messages", response_model=list[StoredMessage])
-async def get_current_conversation_messages(
-    principal: Principal = Depends(get_current_principal),
-) -> list[StoredMessage]:
-    """The one ongoing conversation for the authenticated user — what the
-    frontend calls once on load to repopulate the chat box after a refresh."""
-    conversation_id = await chat_store.get_or_create_conversation(principal.subject)
+class ConversationSummary(BaseModel):
+    id: str
+    title: str | None
+    updated_at: str
+
+
+class CreateConversationResponse(BaseModel):
+    id: str
+
+
+@app.get("/conversations", response_model=list[ConversationSummary])
+async def list_conversations(principal: Principal = Depends(get_current_principal)) -> list[ConversationSummary]:
+    """Ordered most-recently-active first — what populates the sidebar."""
+    rows = await chat_store.list_conversations(principal.subject)
+    return [
+        ConversationSummary(id=str(r["id"]), title=r["title"], updated_at=r["updated_at"].isoformat())
+        for r in rows
+    ]
+
+
+@app.post("/conversations", response_model=CreateConversationResponse)
+async def create_conversation(principal: Principal = Depends(get_current_principal)) -> CreateConversationResponse:
+    conversation_id = await chat_store.create_conversation(principal.subject)
     if conversation_id is None:
+        raise HTTPException(status_code=503, detail="persistence not configured")
+    return CreateConversationResponse(id=conversation_id)
+
+
+@app.get("/conversations/{conversation_id}/messages", response_model=list[StoredMessage])
+async def get_conversation_messages(
+    conversation_id: str, principal: Principal = Depends(get_current_principal)
+) -> list[StoredMessage]:
+    if not chat_store.is_configured():
         return []
+    if await chat_store.get_conversation(conversation_id, principal.subject) is None:
+        raise HTTPException(status_code=404, detail="conversation not found")
     rows = await chat_store.list_messages(conversation_id, principal.subject)
     return [
         StoredMessage(

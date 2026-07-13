@@ -39,21 +39,48 @@ export async function sendChatMessage({ message, mode, sessionId, conversationId
   return resp.json();
 }
 
-/** The authenticated user's persisted chat history (one ongoing conversation
- * — see agent_core/persistence/chat_store.py) — fetched once on login/mount
- * so a page refresh doesn't lose the visible chat log. */
-export async function fetchConversationHistory(token) {
-  const resp = await fetch(`${API_BASE_URL}/conversations/current/messages`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
+function _unauthorizedOr(resp, message) {
   if (resp.status === 401) {
     const err = new Error("unauthorized");
     err.status = 401;
-    throw err;
+    return err;
   }
-  if (!resp.ok) {
-    throw new Error(`fetching chat history failed: ${resp.status}`);
-  }
+  if (!resp.ok) return new Error(`${message}: ${resp.status}`);
+  return null;
+}
+
+/** The authenticated user's conversations (agent_core/persistence/
+ * chat_store.py) — ordered most-recently-active first, what populates the
+ * conversation switcher/sidebar. */
+export async function listConversations(token) {
+  const resp = await fetch(`${API_BASE_URL}/conversations`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const err = _unauthorizedOr(resp, "listing conversations failed");
+  if (err) throw err;
+  return resp.json();
+}
+
+/** Starts a new, empty conversation — returns `{id}`. */
+export async function createConversation(token) {
+  const resp = await fetch(`${API_BASE_URL}/conversations`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const err = _unauthorizedOr(resp, "creating conversation failed");
+  if (err) throw err;
+  return resp.json();
+}
+
+/** One conversation's full message history — fetched on login and whenever
+ * the active conversation is switched, so a page refresh (or a switch back
+ * to an older chat) doesn't lose what's already been said. */
+export async function fetchConversationMessages(token, conversationId) {
+  const resp = await fetch(`${API_BASE_URL}/conversations/${conversationId}/messages`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const err = _unauthorizedOr(resp, "fetching conversation messages failed");
+  if (err) throw err;
   return resp.json();
 }
 

@@ -1,9 +1,10 @@
 """chat_store.py against a fake in-memory asyncpg pool — no live Postgres
 needed. Covers: no-op when POSTGRES_DSN is unset (existing /chat tests rely
 on this), and that conversation/message reads are scoped by user_id so one
-user can never see another's history.
+user can never see another's history or conversations.
 """
 
+import datetime
 import uuid
 
 import pytest
@@ -17,13 +18,13 @@ class _FakeConnection:
         self._messages = messages
 
     async def fetchrow(self, query, *args):
-        if query.startswith("select id from conversations"):
-            (user_id,) = args
-            matches = [c for c in self._conversations.values() if c["user_id"] == user_id]
-            return matches[0] if matches else None
+        if query.startswith("select id from conversations where id"):
+            conversation_id, user_id = args
+            row = self._conversations.get(conversation_id)
+            return row if row and row["user_id"] == user_id else None
         if query.startswith("insert into conversations"):
             (user_id,) = args
-            row = {"id": uuid.uuid4(), "user_id": user_id}
+            row = {"id": uuid.uuid4(), "user_id": user_id, "updated_at": datetime.datetime.now(datetime.timezone.utc)}
             self._conversations[row["id"]] = row
             return row
         if query.startswith("insert into messages"):
@@ -42,11 +43,25 @@ class _FakeConnection:
         raise AssertionError(f"unexpected query: {query}")
 
     async def fetch(self, query, *args):
-        assert query.startswith("select id, role, content, audio_path, response_language")
-        conversation_id, user_id = args
-        return [m for m in self._messages if m["conversation_id"] == conversation_id and m["user_id"] == user_id]
+        if query.startswith("select id, role, content, audio_path, response_language"):
+            conversation_id, user_id = args
+            return [m for m in self._messages if m["conversation_id"] == conversation_id and m["user_id"] == user_id]
+        if query.startswith("select c.id, c.updated_at"):
+            (user_id,) = args
+            rows = []
+            for c in self._conversations.values():
+                if c["user_id"] != user_id:
+                    continue
+                first = next((m for m in self._messages if m["conversation_id"] == c["id"]), None)
+                rows.append({"id": c["id"], "updated_at": c["updated_at"], "title": first["content"] if first else None})
+            return sorted(rows, key=lambda r: r["updated_at"], reverse=True)
+        raise AssertionError(f"unexpected query: {query}")
 
     async def execute(self, query, *args):
+        if query.startswith("update conversations set updated_at"):
+            (conversation_id,) = args
+            self._conversations[conversation_id]["updated_at"] = datetime.datetime.now(datetime.timezone.utc)
+            return
         raise AssertionError(f"unexpected execute: {query}")
 
 
@@ -86,24 +101,56 @@ def fake_pool(monkeypatch):
 
 async def test_no_dsn_is_a_silent_no_op(monkeypatch):
     monkeypatch.delenv("POSTGRES_DSN", raising=False)
-    assert await chat_store.get_or_create_conversation(str(uuid.uuid4())) is None
+    assert chat_store.is_configured() is False
+    assert await chat_store.create_conversation(str(uuid.uuid4())) is None
+    assert await chat_store.get_conversation(str(uuid.uuid4()), str(uuid.uuid4())) is None
+    assert await chat_store.list_conversations(str(uuid.uuid4())) == []
     assert await chat_store.list_messages(str(uuid.uuid4()), str(uuid.uuid4())) == []
 
 
-async def test_get_or_create_conversation_is_idempotent_per_user(fake_pool):
+async def test_create_conversation_then_get_conversation_by_owner(fake_pool):
     user_id = str(uuid.uuid4())
 
-    first = await chat_store.get_or_create_conversation(user_id)
-    second = await chat_store.get_or_create_conversation(user_id)
+    conversation_id = await chat_store.create_conversation(user_id)
 
-    assert first == second
+    assert await chat_store.get_conversation(conversation_id, user_id) is not None
+
+
+async def test_get_conversation_rejects_non_owner(fake_pool):
+    alice = str(uuid.uuid4())
+    bob = str(uuid.uuid4())
+    conversation_id = await chat_store.create_conversation(alice)
+
+    # Same conversation id, wrong user — must not be visible to bob, even
+    # though the backend's own connection would otherwise bypass RLS.
+    assert await chat_store.get_conversation(conversation_id, bob) is None
+
+
+async def test_multiple_conversations_are_isolated_and_ordered_by_recency(fake_pool):
+    user_id = str(uuid.uuid4())
+    first = await chat_store.create_conversation(user_id)
+    second = await chat_store.create_conversation(user_id)  # created after "first"
+
+    # Only "first" gets a message afterward — it should bump ahead of the more
+    # recently *created* but not-yet-messaged "second" conversation.
+    await chat_store.insert_message(first, user_id, "user", "first chat's message")
+
+    first_messages = await chat_store.list_messages(first, user_id)
+    second_messages = await chat_store.list_messages(second, user_id)
+    assert [m["content"] for m in first_messages] == ["first chat's message"]
+    assert second_messages == []  # each conversation's messages stay isolated
+
+    conversations = await chat_store.list_conversations(user_id)
+    assert [c["id"] for c in conversations] == [uuid.UUID(first), uuid.UUID(second)]
+    assert conversations[0]["title"] == "first chat's message"
+    assert conversations[1]["title"] is None  # never messaged -- no title yet
 
 
 async def test_messages_are_scoped_to_owning_user(fake_pool):
     alice = str(uuid.uuid4())
     bob = str(uuid.uuid4())
-    alice_conversation = await chat_store.get_or_create_conversation(alice)
-    bob_conversation = await chat_store.get_or_create_conversation(bob)
+    alice_conversation = await chat_store.create_conversation(alice)
+    bob_conversation = await chat_store.create_conversation(bob)
 
     await chat_store.insert_message(alice_conversation, alice, "user", "alice's message")
     await chat_store.insert_message(bob_conversation, bob, "user", "bob's message")

@@ -67,6 +67,14 @@ export const useAppStore = create((set, get) => ({
   mode: Mode.SPEECH_TO_SPEECH,
   setMode: (mode) => set({ mode }),
 
+  // --- Conversations (ChatGPT/Claude-style switcher) ---
+  // {id, title, updated_at} — title is null until the conversation has a
+  // first message (see chat_store.list_conversations).
+  conversations: [],
+  activeConversationId: null,
+  setConversations: (conversations) => set({ conversations }),
+  setActiveConversationId: (activeConversationId) => set({ activeConversationId }),
+
   // --- Connection (backend REST / speech gateway WS) ---
   connectionState: ConnectionState.CONNECTED,
   setConnectionState: (connectionState) => set({ connectionState }),

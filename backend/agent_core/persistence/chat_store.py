@@ -4,8 +4,10 @@ That checkpointer stays capped/pruned (`_MAX_HISTORY_MESSAGES`) since it only
 needs to hold enough context for the LLM's own reasoning; this module is the
 permanent, user-facing chat log the frontend repopulates on refresh.
 
-One ongoing conversation per user (not a multi-thread sidebar — see the
-Supabase integration plan). Schema: `docs/supabase_schema.sql`.
+Multiple conversations per user (ChatGPT/Claude-style switching) — every
+query is scoped by `user_id` so one user's conversations/messages are never
+visible to another. Schema: `docs/supabase_schema.sql` (unchanged — no new
+table/column needed for multi-conversation support).
 
 Optional at runtime, same pattern as the checkpointer: no `POSTGRES_DSN` means
 no persistence (every `/chat` call still works; history just doesn't survive
@@ -23,6 +25,13 @@ _pool: asyncpg.Pool | None = None
 _pool_dsn: str | None = None
 
 
+def is_configured() -> bool:
+    """Whether persistence is wired up at all — callers use this to tell
+    apart "no DB configured, skip the check" from "checked and not found,
+    404 it" (both otherwise look like a `None` return from get_conversation)."""
+    return bool(os.environ.get("POSTGRES_DSN"))
+
+
 async def _get_pool() -> asyncpg.Pool | None:
     global _pool, _pool_dsn
     dsn = os.environ.get("POSTGRES_DSN")
@@ -38,20 +47,51 @@ async def _get_pool() -> asyncpg.Pool | None:
     return _pool
 
 
-async def get_or_create_conversation(user_id: str) -> str | None:
+async def list_conversations(user_id: str) -> list[dict]:
+    """Returns `[]` (no-op) when persistence isn't configured. Ordered most-
+    recently-active first; `title` is derived from the first message (no
+    dedicated column) and is `None` for a brand-new, still-empty conversation."""
+    pool = await _get_pool()
+    if pool is None:
+        return []
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """select c.id, c.updated_at,
+                      (select content from messages m
+                       where m.conversation_id = c.id order by m.created_at limit 1) as title
+               from conversations c where c.user_id = $1
+               order by c.updated_at desc""",
+            uuid.UUID(user_id),
+        )
+        return [dict(r) for r in rows]
+
+
+async def create_conversation(user_id: str) -> str | None:
     """Returns `None` (no-op) when persistence isn't configured."""
     pool = await _get_pool()
     if pool is None:
         return None
-    uid = uuid.UUID(user_id)
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "select id from conversations where user_id = $1 order by created_at limit 1", uid
+            "insert into conversations (user_id) values ($1) returning id", uuid.UUID(user_id)
         )
-        if row is not None:
-            return str(row["id"])
-        row = await conn.fetchrow("insert into conversations (user_id) values ($1) returning id", uid)
         return str(row["id"])
+
+
+async def get_conversation(conversation_id: str, user_id: str) -> dict | None:
+    """Ownership check — `None` means "doesn't exist or isn't yours," both
+    correctly surfaced as a 404 by the caller (never leaks which). Returns
+    `None` (no-op, not an error) when persistence isn't configured."""
+    pool = await _get_pool()
+    if pool is None:
+        return None
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "select id from conversations where id = $1 and user_id = $2",
+            uuid.UUID(conversation_id),
+            uuid.UUID(user_id),
+        )
+        return dict(row) if row is not None else None
 
 
 async def insert_message(
@@ -74,6 +114,10 @@ async def insert_message(
             role,
             content,
             response_language,
+        )
+        # Bumps the conversation to the top of list_conversations' ordering.
+        await conn.execute(
+            "update conversations set updated_at = now() where id = $1", uuid.UUID(conversation_id)
         )
         return str(row["id"])
 
