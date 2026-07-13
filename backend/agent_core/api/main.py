@@ -272,6 +272,18 @@ async def chat_stream(req: ChatRequest, principal: Principal = Depends(get_curre
                 "translation_applied": decide_translation(lang_result.language),
             }
         )
+        # Sent BEFORE any text_delta — the detected language is known from the
+        # user's own message, before task_agent even starts, so the frontend
+        # can open its TTS socket with the right voice from the first chunk
+        # instead of guessing (or waiting for "done" and re-doing it late).
+        yield _sse_event(
+            {
+                "type": "language",
+                "response_language": session.response_language,
+                "language_confidence": session.language_confidence,
+                "is_code_mixed": session.is_code_mixed,
+            }
+        )
 
         # Mirrors graph.py's route_after_language — never call the LLM at all
         # on low-confidence input, ask a deterministic clarifying question.

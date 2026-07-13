@@ -1,5 +1,5 @@
 import { useCallback, useRef } from "react";
-import { sendChatMessage, revealProgressively } from "../api/chatClient";
+import { streamChatMessage } from "../api/chatClient";
 import { MicCapture } from "../api/micCapture";
 import { supabase } from "../api/supabaseClient";
 import { TTSPlayer } from "../api/ttsPlayback";
@@ -126,10 +126,22 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
     concludeRef.current = null;
   }, []);
 
-  const speakReply = useCallback(async (text, language, messageServerId) => {
-    setVoiceState(VoiceState.SPEAKING);
-    const player = (ttsPlayerRef.current ??= new TTSPlayer());
-    await new Promise((resolve) => {
+  // Opens a TTS socket immediately (before the full reply text is even known)
+  // and lets the caller feed it text chunks as they stream in from /chat/stream
+  // — `sendChunk`/`finish` both await the socket's "open" event internally, so
+  // callers can call `sendChunk` as soon as each delta arrives without
+  // worrying about connection timing; order is preserved since awaits on the
+  // same promise resolve in the order they were registered.
+  const openSpeakSession = useCallback(
+    (language) => {
+      setVoiceState(VoiceState.SPEAKING);
+      const player = (ttsPlayerRef.current ??= new TTSPlayer());
+      // "unknown" is a real value `response_language` can carry (low-confidence
+      // detection) — not a valid Sarvam language code. Sending it straight
+      // through as-is made synthesis fail outright ("I'm having trouble with
+      // audio right now"), even though the text itself (e.g. the English
+      // clarifying question) was perfectly speakable in English.
+      const ttsLanguage = language && language !== "unknown" ? language : "en";
       const socket = new VoiceSocketClient({
         onAudioChunk: (chunk) => {
           player.playChunk(chunk).catch(() => {}); // one bad chunk shouldn't abort the whole reply
@@ -143,71 +155,92 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
           }
         },
       });
-      // "unknown" is a real value `response_language` can carry (low-confidence
-      // detection) — not a valid Sarvam language code. Sending it straight
-      // through as-is made synthesis fail outright ("I'm having trouble with
-      // audio right now"), even though the text itself (e.g. the English
-      // clarifying question) was perfectly speakable in English.
-      const ttsLanguage = language && language !== "unknown" ? language : "en";
       const ws = socket.connectTTS({ language: ttsLanguage, model: "bulbul:v3" });
-      ws.addEventListener("open", () => {
-        socket.sendText(text);
-        socket.endTTSUtterance();
+      const opened = new Promise((resolve) => ws.addEventListener("open", resolve));
+      const closed = new Promise((resolve) => {
+        ws.addEventListener("close", resolve); // /ws/tts closes once the utterance is fully synthesized
+        ws.addEventListener("error", resolve);
       });
-      ws.addEventListener("close", resolve); // /ws/tts closes once the utterance is fully synthesized
-      ws.addEventListener("error", resolve);
-    });
-    setVoiceState(VoiceState.IDLE);
-
-    const blob = player.finish();
-    saveReplyAudio({ userId, messageServerId, blob, onSaved: setMessageAudioPath }).catch(() => {});
-  }, [setVoiceState, userId, setMessageAudioPath]);
+      return {
+        async sendChunk(chunk) {
+          await opened;
+          socket.sendText(chunk);
+        },
+        async finish() {
+          await opened;
+          socket.endTTSUtterance();
+          await closed;
+          setVoiceState(VoiceState.IDLE);
+          return player.finish();
+        },
+      };
+    },
+    [setVoiceState, addMessage]
+  );
 
   const sendMessage = useCallback(
-    async (text) => {
-      const assistantId = addMessage("assistant", "", { streaming: true });
-      try {
-        const result = await sendChatMessage({
-          message: text,
-          mode,
-          sessionId: ids.current.sessionId,
-          conversationId: ids.current.conversationId,
-          threadId: ids.current.threadId,
-          token,
-        });
-        setLanguageInfo({
-          responseLanguage: result.response_language,
-          languageConfidence: result.language_confidence,
-          isCodeMixed: result.is_code_mixed,
-        });
-        if (result.message_id) setMessageServerId(assistantId, result.message_id);
+    (text) =>
+      new Promise((resolve) => {
+        const assistantId = addMessage("assistant", "", { streaming: true });
+        const isVoiceOutput = mode === Mode.SPEECH_TO_SPEECH || mode === Mode.TEXT_TO_SPEECH;
+        let speakSession = null;
 
-        if (mode === Mode.SPEECH_TO_SPEECH || mode === Mode.TEXT_TO_SPEECH) {
-          // TTS synthesis (real network + audio time) used to wait for the
-          // word-by-word text reveal to finish first, purely because they
-          // were two sequential `await`s — pure wasted time before the user
-          // heard anything. Running them together means the reply is both
-          // visible and audible as soon as possible, not one after the other.
-          await Promise.all([
-            revealProgressively(result.response, (chunk) => appendToMessage(assistantId, chunk)),
-            speakReply(result.response, result.response_language, result.message_id),
-          ]);
-          finishMessage(assistantId);
-        } else {
-          await revealProgressively(result.response, (chunk) => appendToMessage(assistantId, chunk));
+        streamChatMessage(
+          {
+            message: text,
+            mode,
+            sessionId: ids.current.sessionId,
+            conversationId: ids.current.conversationId,
+            threadId: ids.current.threadId,
+            token,
+          },
+          {
+            onLanguage: (event) => {
+              // Opens the TTS socket with the REAL detected language up
+              // front — known from the user's own message, before any
+              // answer text exists, so voice starts on the very first
+              // chunk instead of waiting for the whole reply to also learn
+              // what language it turned out to be in.
+              if (isVoiceOutput) speakSession = openSpeakSession(event.response_language);
+            },
+            onTextDelta: (chunk) => {
+              appendToMessage(assistantId, chunk);
+              speakSession?.sendChunk(chunk);
+            },
+            onDone: async (doneEvent) => {
+              setLanguageInfo({
+                responseLanguage: doneEvent.response_language,
+                languageConfidence: doneEvent.language_confidence,
+                isCodeMixed: doneEvent.is_code_mixed,
+              });
+              if (doneEvent.message_id) setMessageServerId(assistantId, doneEvent.message_id);
+              finishMessage(assistantId);
+              if (speakSession) {
+                const blob = await speakSession.finish();
+                saveReplyAudio({
+                  userId,
+                  messageServerId: doneEvent.message_id,
+                  blob,
+                  onSaved: setMessageAudioPath,
+                }).catch(() => {});
+              } else {
+                setVoiceState(VoiceState.IDLE);
+              }
+              resolve();
+            },
+          }
+        ).catch((err) => {
+          if (err.status === 401) {
+            onUnauthorized?.();
+            resolve();
+            return;
+          }
+          appendToMessage(assistantId, "Sorry, something went wrong reaching the assistant.");
           finishMessage(assistantId);
           setVoiceState(VoiceState.IDLE);
-        }
-      } catch (err) {
-        if (err.status === 401) {
-          onUnauthorized?.();
-          return;
-        }
-        appendToMessage(assistantId, "Sorry, something went wrong reaching the assistant.");
-        finishMessage(assistantId);
-        setVoiceState(VoiceState.IDLE);
-      }
-    },
+          resolve();
+        });
+      }),
     [
       mode,
       token,
@@ -218,8 +251,10 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
       finishMessage,
       setLanguageInfo,
       setMessageServerId,
+      setMessageAudioPath,
       setVoiceState,
-      speakReply,
+      userId,
+      openSpeakSession,
     ]
   );
 

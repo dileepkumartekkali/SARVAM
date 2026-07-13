@@ -1,19 +1,23 @@
 import { API_BASE_URL } from "./config";
 
 /**
- * `POST /chat` on the current backend (Phases 2-6) returns one complete JSON
- * response — it does not stream tokens over HTTP yet, even though the
- * underlying LLMRouter/task_agent were built streaming-first (Phase 1).
- * Exposing that as a real SSE/chunked endpoint is a backend change outside
- * this frontend phase's scope. `revealProgressively` below simulates the
- * streaming *display* the requirement asks for by revealing the already-
- * fetched response incrementally — it is a presentation-layer approximation,
- * not real network streaming. Swap this for a real `EventSource`/fetch-stream
- * reader the moment a streaming endpoint exists; nothing else in the UI
- * needs to change, since components only ever see `appendToMessage` calls.
+ * `POST /chat/stream` (agent_core.api.main + task_agent.stream_turn) — real
+ * SSE token/sentence streaming. Event sequence: one `{"type":"language",
+ * response_language, language_confidence, is_code_mixed}` event first (the
+ * detected language is known from the user's own message, before any answer
+ * text exists — the frontend needs it up front to open a TTS socket with the
+ * right voice from chunk one, not after the whole reply is already known),
+ * then `{"type":"text_delta","text":...}` events as sentence-bounded chunks
+ * become ready, then one final `{"type":"done", message_id, self_check_ok,
+ * pending_confirmation}` event. Calls `onLanguage`/`onTextDelta`/`onDone` as
+ * those arrive — there is no single resolved return value, since the whole
+ * point is not waiting for the full response before doing anything with it.
  */
-export async function sendChatMessage({ message, mode, sessionId, conversationId, threadId, token, sttLanguageHint }) {
-  const resp = await fetch(`${API_BASE_URL}/chat`, {
+export async function streamChatMessage(
+  { message, mode, sessionId, conversationId, threadId, token, sttLanguageHint },
+  { onLanguage, onTextDelta, onDone }
+) {
+  const resp = await fetch(`${API_BASE_URL}/chat/stream`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -33,10 +37,30 @@ export async function sendChatMessage({ message, mode, sessionId, conversationId
     err.status = 401;
     throw err;
   }
-  if (!resp.ok) {
-    throw new Error(`chat request failed: ${resp.status}`);
+  if (!resp.ok || !resp.body) {
+    throw new Error(`chat stream request failed: ${resp.status}`);
   }
-  return resp.json();
+
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let boundary;
+    while ((boundary = buffer.indexOf("\n\n")) !== -1) {
+      const block = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      for (const line of block.split("\n")) {
+        if (!line.startsWith("data:")) continue;
+        const event = JSON.parse(line.slice(5).trim());
+        if (event.type === "language") onLanguage?.(event);
+        else if (event.type === "text_delta") onTextDelta?.(event.text);
+        else if (event.type === "done") onDone?.(event);
+      }
+    }
+  }
 }
 
 function _unauthorizedOr(resp, message) {
@@ -98,33 +122,4 @@ export async function deleteConversation(token, conversationId) {
   });
   const err = _unauthorizedOr(resp, "deleting conversation failed");
   if (err) throw err;
-}
-
-/** Reveals `text` into the store a few words at a time. Returns a promise
- * that resolves once the whole text has been appended. */
-export function revealProgressively(text, onChunk, { wordsPerTick = 3, tickMs = 40 } = {}) {
-  // In a hidden/background tab the browser throttles chained setTimeouts
-  // (Chrome: down to ~1/minute), freezing the animation mid-text and — worse
-  // — leaving this promise unresolved, so the message stays "streaming" and
-  // the voice state machine never returns to idle. Nobody is watching a
-  // hidden tab's animation anyway: append everything at once.
-  if (document.hidden) {
-    onChunk(text + " ");
-    return Promise.resolve();
-  }
-  const words = text.split(" ");
-  let i = 0;
-  return new Promise((resolve) => {
-    function tick() {
-      if (i >= words.length) {
-        resolve();
-        return;
-      }
-      const slice = words.slice(i, i + wordsPerTick).join(" ") + " ";
-      onChunk(slice);
-      i += wordsPerTick;
-      setTimeout(tick, tickMs);
-    }
-    tick();
-  });
 }

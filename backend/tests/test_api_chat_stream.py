@@ -52,7 +52,12 @@ def test_chat_stream_end_to_end(monkeypatch):
 
     assert resp.status_code == 200
     events = _parse_sse(resp.text)
-    assert len(events) >= 2  # at least one text_delta plus the final done
+    assert len(events) >= 3  # language, at least one text_delta, final done
+    # The detected language arrives BEFORE any text_delta -- the frontend
+    # needs it to open its TTS socket with the right voice from chunk one,
+    # not after the whole reply (and its language) is already known.
+    assert events[0]["type"] == "language"
+    assert events[0]["response_language"] == "en"
     done = events[-1]
     assert done["type"] == "done"
     assert done["self_check_ok"] is True
