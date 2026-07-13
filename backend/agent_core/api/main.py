@@ -26,7 +26,7 @@ from ..tools import build_default_registry
 configure_logging()
 init_tracing("backend")
 
-app = FastAPI(title="MAAV / Vaani backend", version="0.1.0")
+app = FastAPI(title="MAAV / Mvoice backend", version="0.1.0")
 
 # Explicit allow-list only — no wildcard-with-credentials, which browsers
 # treat as a CORS misconfiguration anyway. Empty by default (deny all

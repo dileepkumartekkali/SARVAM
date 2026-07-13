@@ -1,4 +1,4 @@
-# Software Architecture Document — MAAV / Vaani
+# Software Architecture Document — MAAV / Mvoice
 
 **Written against what was actually built across Phases 1-8, not the
 original aspirational brief.** Every claim below points at a real file,

@@ -1,4 +1,4 @@
-# MAAV / Vaani — multilingual voice agent
+# MAAV / Mvoice — multilingual voice agent
 
 A multilingual (13 languages + code-mixing) assistant built on a LangGraph
 supervisor, a multi-provider LLM router with fallback, Sarvam AI STT/TTS

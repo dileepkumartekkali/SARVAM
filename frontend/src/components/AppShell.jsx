@@ -34,7 +34,7 @@ export default function AppShell({
               <path fill="currentColor" d="M4 6h16v2H4V6Zm0 5h16v2H4v-2Zm0 5h16v2H4v-2Z" />
             </svg>
           </button>
-          <span className="app-shell__brand">Vaani</span>
+          <span className="app-shell__brand">Mvoice</span>
         </div>
         <div className="app-shell__topbar-right">
           <LanguageBadge language={responseLanguage} confidence={languageConfidence} isCodeMixed={isCodeMixed} />

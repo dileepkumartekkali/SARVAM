@@ -1,4 +1,4 @@
-# MAAV / Vaani — Threat Model (v1)
+# MAAV / Mvoice — Threat Model (v1)
 
 Scope: the backend (`agent_core.api`), the Speech Gateway
 (`agent_core.speech_gateway`), and the LangGraph reasoning pipeline

@@ -1,4 +1,4 @@
-"""MAAV / Vaani agent core.
+"""MAAV / Mvoice agent core.
 
 The package is layered so that provider- and transport-specific concerns never
 leak into the reasoning core:

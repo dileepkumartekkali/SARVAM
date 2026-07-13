@@ -33,7 +33,7 @@ export default function LoginScreen() {
   return (
     <div className="login-screen">
       <div className="login-card">
-        <div className="login-card__brand">Vaani</div>
+        <div className="login-card__brand">Mvoice</div>
         <p className="login-card__tagline">Your multilingual voice assistant</p>
         {error && <div className="login-card__error">{error}</div>}
         <button type="button" className="login-card__submit login-card__google" onClick={signInWithGoogle} disabled={busy}>
