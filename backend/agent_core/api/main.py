@@ -287,6 +287,7 @@ async def chat_stream(req: ChatRequest, principal: Principal = Depends(get_curre
 
         # Mirrors graph.py's route_after_language — never call the LLM at all
         # on low-confidence input, ask a deterministic clarifying question.
+        is_error = False
         if (lang_result.confidence or 0.0) < LOW_CONFIDENCE_THRESHOLD:
             final_text = CLARIFYING_QUESTION
             self_check_ok = True
@@ -314,14 +315,21 @@ async def chat_stream(req: ChatRequest, principal: Principal = Depends(get_curre
             final_text = final_event["text"]
             self_check_ok = final_event["self_check_ok"]
             pending = final_event.get("pending_confirmation")
+            is_error = final_event.get("error", False)
             # Clarify turns are deliberately NOT added to history, matching
             # graph.py's clarify_node (which never touches the "history" key).
-            _stream_history[req.thread_id] = (
-                history + [{"role": "user", "content": req.message}, {"role": "assistant", "content": final_text}]
-            )[-_STREAM_MAX_HISTORY_MESSAGES:]
+            # A failed turn (is_error) isn't added either — there's nothing
+            # real for the agent to remember, and it shouldn't bias the next
+            # turn's context with an apology that wasn't really an answer.
+            if not is_error:
+                _stream_history[req.thread_id] = (
+                    history + [{"role": "user", "content": req.message}, {"role": "assistant", "content": final_text}]
+                )[-_STREAM_MAX_HISTORY_MESSAGES:]
 
+        # A failed turn (is_error) is shown to the user but never persisted —
+        # it's not a real answer, so it shouldn't clutter their saved history.
         assistant_message_id = None
-        if persistence_on:
+        if persistence_on and not is_error:
             assistant_message_id = str(uuid.uuid4())
             asyncio.create_task(
                 chat_store.record_turn(
@@ -342,6 +350,11 @@ async def chat_stream(req: ChatRequest, principal: Principal = Depends(get_curre
                 "language_confidence": session.language_confidence,
                 "is_code_mixed": session.is_code_mixed,
                 "self_check_ok": self_check_ok,
+                "error": is_error,
+                # Only actually needed for the error path (no text_delta was
+                # ever sent for it) — harmless to include always rather than
+                # have the frontend handle two different response shapes.
+                "text": final_text if is_error else None,
                 "pending_confirmation": (
                     {"token": pending.token, "tool_name": pending.tool_name, "args": pending.args}
                     if pending is not None

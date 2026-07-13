@@ -173,6 +173,14 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
           setVoiceState(VoiceState.IDLE);
           return player.finish();
         },
+        // Closes without ever speaking anything — for a turn that failed
+        // before any real text existed (no sendChunk was ever called), so
+        // there's nothing to finish speaking, just a socket to tidy up.
+        abort() {
+          socket.closeTTS();
+          player.close();
+          setVoiceState(VoiceState.IDLE);
+        },
       };
     },
     [setVoiceState, addMessage]
@@ -208,6 +216,19 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
               speakSession?.sendChunk(chunk);
             },
             onDone: async (doneEvent) => {
+              // A failed turn (no LLM provider answered) is not a real reply
+              // — never spoken aloud (it wasn't sent as a text_delta, so it
+              // never reached TTS) and never saved to history (the backend
+              // already skipped persisting it). It's still shown as a
+              // message so the user knows what happened, silently.
+              if (doneEvent.error) {
+                appendToMessage(assistantId, doneEvent.text);
+                finishMessage(assistantId);
+                if (speakSession) speakSession.abort();
+                else setVoiceState(VoiceState.IDLE);
+                resolve();
+                return;
+              }
               setLanguageInfo({
                 responseLanguage: doneEvent.response_language,
                 languageConfidence: doneEvent.language_confidence,

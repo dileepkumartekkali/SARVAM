@@ -7,9 +7,10 @@ self-check failure being logged rather than corrected (no regeneration call
 
 from agent_core.agents.task_agent import stream_turn
 from agent_core.llm_adapter import LLMRouter
+from agent_core.llm_adapter.base import LLMProviderError
 from agent_core.supervisor.state import Mode, SessionState
 
-from ._fakes import ScriptedProvider
+from ._fakes import FakeProvider, ScriptedProvider
 
 
 def _session(mode=Mode.TEXT_TO_TEXT) -> SessionState:
@@ -86,3 +87,21 @@ async def test_stream_turn_self_check_failure_is_logged_not_corrected():
     assert provider.call_count == 1
     # The streamed text stands as-is -- not silently swapped for something else.
     assert done["text"] == long_reply
+
+
+async def test_stream_turn_provider_failure_never_yields_a_text_delta():
+    """The apology on total provider failure is not a real answer -- it must
+    never be spoken aloud (voice mode's TTS socket is fed from text_delta
+    events) or persisted as chat history (main.py skips both when the final
+    "done" event's error flag is set). It only ever reaches the caller via
+    the "done" event's own text field."""
+    provider = FakeProvider("x", error=LLMProviderError("boom", retriable=False))
+    router = LLMRouter([provider])
+
+    events = [e async for e in stream_turn(_session(), router, "hi")]
+
+    assert all(e["type"] != "text_delta" for e in events)
+    done = events[-1]
+    assert done["type"] == "done"
+    assert done["error"] is True
+    assert "trouble" in done["text"].lower()

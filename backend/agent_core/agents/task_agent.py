@@ -373,7 +373,12 @@ async def stream_turn(
             return
         except LLMProviderError:
             logger.info("turn_trace", extra={"prompt_version": version_id, "provider_error": True, "streamed": True})
-            yield {"type": "text_delta", "text": LLM_UNAVAILABLE_APOLOGY}
+            # No text_delta here, deliberately — this apology is not a real
+            # answer, so it must never be spoken aloud (the frontend opens
+            # its TTS socket before this point, from the language event) or
+            # persisted as chat history. `error: True` is the caller's signal
+            # to skip both; the text still comes back so it can be shown as a
+            # (silent, unsaved) message.
             yield {
                 "type": "done",
                 "text": LLM_UNAVAILABLE_APOLOGY,
@@ -382,6 +387,7 @@ async def stream_turn(
                 "self_check_ok": True,
                 "self_check_reason": "",
                 "pending_confirmation": None,
+                "error": True,
             }
             return
 
