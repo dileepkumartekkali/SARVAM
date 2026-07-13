@@ -16,6 +16,7 @@ a restart), so local dev/CI/tests need no database.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import uuid
@@ -121,6 +122,44 @@ async def get_conversation(conversation_id: str, user_id: str) -> dict | None:
         return dict(row) if row is not None else None
 
 
+async def _insert_message_on(
+    conn,
+    conversation_id: str,
+    user_id: str,
+    role: str,
+    content: str,
+    response_language: str | None = None,
+    message_id: str | None = None,
+) -> str:
+    """The actual insert, run on a caller-supplied connection so `record_turn`
+    can wrap two calls in one transaction. `insert_message` (below) is the
+    standalone version most callers want; this is the shared plumbing."""
+    if message_id is not None:
+        row = await conn.fetchrow(
+            """insert into messages (id, conversation_id, user_id, role, content, response_language)
+               values ($1, $2, $3, $4, $5, $6) returning id""",
+            uuid.UUID(message_id),
+            uuid.UUID(conversation_id),
+            uuid.UUID(user_id),
+            role,
+            content,
+            response_language,
+        )
+    else:
+        row = await conn.fetchrow(
+            """insert into messages (conversation_id, user_id, role, content, response_language)
+               values ($1, $2, $3, $4, $5) returning id""",
+            uuid.UUID(conversation_id),
+            uuid.UUID(user_id),
+            role,
+            content,
+            response_language,
+        )
+    # Bumps the conversation to the top of list_conversations' ordering.
+    await conn.execute("update conversations set updated_at = now() where id = $1", uuid.UUID(conversation_id))
+    return str(row["id"])
+
+
 async def insert_message(
     conversation_id: str,
     user_id: str,
@@ -136,32 +175,11 @@ async def insert_message(
     if pool is None:
         return None
     async with pool.acquire() as conn:
-        if message_id is not None:
-            row = await conn.fetchrow(
-                """insert into messages (id, conversation_id, user_id, role, content, response_language)
-                   values ($1, $2, $3, $4, $5, $6) returning id""",
-                uuid.UUID(message_id),
-                uuid.UUID(conversation_id),
-                uuid.UUID(user_id),
-                role,
-                content,
-                response_language,
-            )
-        else:
-            row = await conn.fetchrow(
-                """insert into messages (conversation_id, user_id, role, content, response_language)
-                   values ($1, $2, $3, $4, $5) returning id""",
-                uuid.UUID(conversation_id),
-                uuid.UUID(user_id),
-                role,
-                content,
-                response_language,
-            )
-        # Bumps the conversation to the top of list_conversations' ordering.
-        await conn.execute(
-            "update conversations set updated_at = now() where id = $1", uuid.UUID(conversation_id)
-        )
-        return str(row["id"])
+        return await _insert_message_on(conn, conversation_id, user_id, role, content, response_language, message_id)
+
+
+_RECORD_TURN_MAX_ATTEMPTS = 3
+_RECORD_TURN_RETRY_DELAY_SECONDS = 0.5
 
 
 async def record_turn(
@@ -175,16 +193,38 @@ async def record_turn(
     """Persists both sides of a turn — meant to run as a FastAPI background
     task, AFTER the HTTP response already went out, so a user never waits on
     a DB write just to see the answer they were given synchronously. No-op
-    if persistence isn't configured. Failures are swallowed: a lost history
-    write must never surface as an error for a turn the user already got a
-    real answer to."""
-    try:
-        await insert_message(conversation_id, user_id, "user", user_message)
-        await insert_message(
-            conversation_id, user_id, "assistant", assistant_message, response_language, message_id=assistant_message_id
-        )
-    except Exception:
-        logger.exception("record_turn failed for conversation_id=%s -- turn was answered but not persisted", conversation_id)
+    if persistence isn't configured.
+
+    Both inserts run in ONE transaction (never a half-saved turn — the user
+    message without its reply, or vice versa) and retry up to 3 times with a
+    short delay to ride out a transient blip (a dropped connection, a
+    momentary Supabase hiccup) rather than losing the turn to something that
+    would have worked a second later. If every attempt fails, the failure is
+    logged, not raised — a lost history write must never surface as an error
+    for a turn the user already got a real answer to (see the accepted
+    remaining risk — process death mid-task — in docs/SAD.md)."""
+    pool = await _get_pool()
+    if pool is None:
+        return
+    for attempt in range(_RECORD_TURN_MAX_ATTEMPTS):
+        try:
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    await _insert_message_on(conn, conversation_id, user_id, "user", user_message)
+                    await _insert_message_on(
+                        conn, conversation_id, user_id, "assistant", assistant_message, response_language,
+                        message_id=assistant_message_id,
+                    )
+            return
+        except Exception:
+            if attempt == _RECORD_TURN_MAX_ATTEMPTS - 1:
+                logger.exception(
+                    "record_turn failed after %d attempts for conversation_id=%s -- turn was answered but not persisted",
+                    _RECORD_TURN_MAX_ATTEMPTS,
+                    conversation_id,
+                )
+            else:
+                await asyncio.sleep(_RECORD_TURN_RETRY_DELAY_SECONDS * (attempt + 1))
 
 
 async def list_messages(conversation_id: str, user_id: str) -> list[dict]:

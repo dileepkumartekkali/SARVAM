@@ -85,6 +85,17 @@ class _FakeConnection:
             return "DELETE 1"
         raise AssertionError(f"unexpected execute: {query}")
 
+    def transaction(self):
+        return _FakeTransactionCtx()
+
+
+class _FakeTransactionCtx:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False  # never swallows -- an exception inside must still propagate
+
 
 class _FakeAcquireCtx:
     def __init__(self, conn):
@@ -200,16 +211,38 @@ async def test_record_turn_persists_both_sides_with_the_given_assistant_id(fake_
     assert str(messages[1]["id"]) == assistant_message_id
 
 
-async def test_record_turn_swallows_errors_without_raising(fake_pool, monkeypatch, caplog):
+async def test_record_turn_retries_a_transient_failure_then_succeeds(fake_pool, monkeypatch):
+    user_id = str(uuid.uuid4())
+    conversation_id = await chat_store.create_conversation(user_id)
+    real_insert = chat_store._insert_message_on
+    calls = {"n": 0}
+
+    async def _flaky(conn, *a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("transient connection drop")
+        return await real_insert(conn, *a, **k)
+
+    monkeypatch.setattr(chat_store, "_insert_message_on", _flaky)
+    monkeypatch.setattr(chat_store, "_RECORD_TURN_RETRY_DELAY_SECONDS", 0)  # don't actually wait in tests
+
+    await chat_store.record_turn(conversation_id, user_id, "hi there", "hello!", "en", str(uuid.uuid4()))
+
+    messages = await chat_store.list_messages(conversation_id, user_id)
+    assert [m["content"] for m in messages] == ["hi there", "hello!"]
+
+
+async def test_record_turn_swallows_errors_without_raising_after_exhausting_retries(fake_pool, monkeypatch, caplog):
     async def _boom(*a, **k):
         raise RuntimeError("db exploded")
 
-    monkeypatch.setattr(chat_store, "insert_message", _boom)
+    monkeypatch.setattr(chat_store, "_insert_message_on", _boom)
+    monkeypatch.setattr(chat_store, "_RECORD_TURN_RETRY_DELAY_SECONDS", 0)  # don't actually wait in tests
 
     # Must not raise -- this runs as a background task after the user
     # already got their answer; a persistence failure can't become a 500.
     await chat_store.record_turn(str(uuid.uuid4()), str(uuid.uuid4()), "hi", "hello", "en", str(uuid.uuid4()))
-    assert "record_turn failed" in caplog.text
+    assert "record_turn failed after 3 attempts" in caplog.text
 
 
 async def test_delete_conversation_removes_it_and_its_messages(fake_pool):
