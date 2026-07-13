@@ -12,7 +12,7 @@ const LABELS = {
  * a boolean) so re-triggering while already flashed still re-fires the
  * animation — the visual cue the task asked for: the user should SEE the
  * interruption land, not just hear the audio cut off. */
-export default function VoiceOrb({ voiceState, bargeInSignal, onToggle }) {
+export default function VoiceOrb({ voiceState, bargeInSignal, onToggle, disabled }) {
   const [flashing, setFlashing] = useState(false);
   const lastSignal = useRef(bargeInSignal);
 
@@ -31,6 +31,7 @@ export default function VoiceOrb({ voiceState, bargeInSignal, onToggle }) {
         type="button"
         className={`voice-orb voice-orb--${voiceState}${flashing ? " voice-orb--flash" : ""}`}
         onClick={onToggle}
+        disabled={disabled}
         aria-label={LABELS[voiceState]}
       >
         {voiceState === VoiceState.SPEAKING ? (

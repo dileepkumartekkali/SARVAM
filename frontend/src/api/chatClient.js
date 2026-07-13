@@ -45,7 +45,11 @@ function _unauthorizedOr(resp, message) {
     err.status = 401;
     return err;
   }
-  if (!resp.ok) return new Error(`${message}: ${resp.status}`);
+  if (!resp.ok) {
+    const err = new Error(`${message}: ${resp.status}`);
+    err.status = resp.status;
+    return err;
+  }
   return null;
 }
 

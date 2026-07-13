@@ -39,7 +39,7 @@ export default function Composer({ mode, onModeChange, onSend, voiceState, barge
 
       {voiceInput ? (
         <div className="composer__voice">
-          <VoiceOrb voiceState={voiceState} bargeInSignal={bargeInSignal} onToggle={onVoiceToggle} />
+          <VoiceOrb voiceState={voiceState} bargeInSignal={bargeInSignal} onToggle={onVoiceToggle} disabled={disabled} />
         </div>
       ) : (
         <form className="composer__form" onSubmit={submit}>

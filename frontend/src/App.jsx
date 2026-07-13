@@ -27,6 +27,7 @@ export default function App() {
   const mode = useAppStore((s) => s.mode);
   const setMode = useAppStore((s) => s.setMode);
   const messages = useAppStore((s) => s.messages);
+  const addMessage = useAppStore((s) => s.addMessage);
   const loadMessages = useAppStore((s) => s.loadMessages);
   const conversations = useAppStore((s) => s.conversations);
   const activeConversationId = useAppStore((s) => s.activeConversationId);
@@ -40,6 +41,12 @@ export default function App() {
   const bargeInSignal = useAppStore((s) => s.bargeInSignal);
 
   const [sending, setSending] = useState(false);
+  // Gates the composer: false while the first conversation is being loaded/
+  // created. Without this, a message sent in the split-second before that
+  // resolves would go out with the placeholder id `ids.current` starts with
+  // — a real 404 from the backend, since persistence (when configured)
+  // rejects any conversation_id it never actually created.
+  const [conversationReady, setConversationReady] = useState(false);
 
   // Stable per-tab conversation identity — thread_id is the checkpointer key
   // the backend resumes from on reconnect (SessionState.thread_id).
@@ -85,12 +92,12 @@ export default function App() {
   // On login: load the conversation list, creating the first one if this is
   // a brand-new user, then load its messages — the one place a page refresh
   // would otherwise lose everything, since /chat itself is stateless from
-  // the frontend's perspective (see chatClient.js). If persistence isn't
-  // configured on the backend (no POSTGRES_DSN), these calls fail and the
-  // app falls back to the random local id ids.current already started with
-  // — same stateless behavior as before multi-chat existed.
+  // the frontend's perspective (see chatClient.js). The composer stays
+  // disabled (conversationReady=false) until this settles, one way or
+  // another — see the note on conversationReady above.
   useEffect(() => {
     if (!token) return;
+    setConversationReady(false);
     (async () => {
       try {
         let list = await listConversations(token);
@@ -102,11 +109,25 @@ export default function App() {
         activateConversation(list[0].id);
         const history = await fetchConversationMessages(token, list[0].id);
         loadMessages(history);
+        setConversationReady(true);
       } catch (err) {
-        if (err.status === 401) handleLogout();
-        // else: persistence not configured, or a transient error — keep the
-        // random local conversation id from initial mount and carry on
-        // stateless, rather than blocking the app from working at all.
+        if (err.status === 401) {
+          handleLogout();
+          return;
+        }
+        if (err.status === 503) {
+          // POST /conversations only ever 503s when POSTGRES_DSN isn't set
+          // on the backend at all — no persistence configured, so the
+          // random local id from initial mount is exactly what a stateless
+          // /chat expects, same as before multi-chat existed.
+          setConversationReady(true);
+          return;
+        }
+        // Persistence IS configured but this failed (network blip, backend
+        // hiccup) — sending now would just 404 against a conversation id the
+        // backend never created, so surface it and leave the composer
+        // disabled rather than let that happen silently.
+        addMessage("assistant", "Couldn't start a conversation — check your connection and reload the page.");
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -183,7 +204,7 @@ export default function App() {
         voiceState={voiceState}
         bargeInSignal={bargeInSignal}
         onVoiceToggle={onVoiceToggle}
-        disabled={sending}
+        disabled={sending || !conversationReady}
       />
     </AppShell>
   );
