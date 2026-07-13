@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { SUPABASE_ANON_KEY } from "../api/config";
 import { supabase } from "../api/supabaseClient";
 
 export default function LoginScreen() {
@@ -10,7 +11,15 @@ export default function LoginScreen() {
     setError(null);
     const { error: signInError } = await supabase.auth.signInWithOAuth({
       provider: "google",
-      options: { redirectTo: window.location.origin },
+      options: {
+        redirectTo: window.location.origin,
+        // This client version's OAuth redirect never attaches an apikey (it's
+        // a plain browser navigation, not a fetch() call it can add headers
+        // to) — some Supabase projects' gateway rejects unauthenticated
+        // requests to /authorize without one ("No API key found in
+        // request"), so it's passed explicitly here.
+        queryParams: { apikey: SUPABASE_ANON_KEY },
+      },
     });
     if (signInError) {
       setError("Couldn't start Google sign-in — please try again.");
