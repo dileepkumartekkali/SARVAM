@@ -68,6 +68,25 @@ Every step above is real and covered by tests — see
 `backend/tests/test_task_agent*.py`, `test_agentic_loop_real_tools.py`,
 `test_language_agent.py`, `test_graph.py`.
 
+**`POST /chat/stream`** is the real-traffic path the frontend actually uses
+(the diagram above still describes `/chat`, kept as a non-streaming
+reference for `scripts/load_test.py`/`chaos_test.py`). Instead of waiting
+for the whole answer, it streams Server-Sent Events: one `language` event
+first (detected from the user's own message, before any answer text
+exists — the frontend opens its TTS socket with the right voice immediately
+instead of waiting), then `text_delta` events as sentence-bounded chunks
+become ready (`agent_core/speech/chunker.py`'s `chunk_stream`, fed by
+`LLMRouter.stream_with_fallback` — both already existed and were already
+tested, just never connected end-to-end until now), then one final `done`
+event. Two accepted trade-offs, documented in `task_agent.stream_turn`'s own
+docstring: a self-check failure on a streamed turn is logged, not corrected
+by regenerating and re-speaking a different draft (audio may already be
+playing), and tool-call detection on the streamed path uses the legacy
+`TOOL_CALL:` text convention rather than native structured calls (falls back
+to the full non-streaming `run_turn()` the instant one is sniffed, before
+anything is ever shown/spoken). See `backend/tests/test_task_agent_stream.py`
+/ `test_api_chat_stream.py`.
+
 ### 2. Speech — STT and TTS (two independently real capabilities, not yet one continuous voice loop)
 
 The Speech Gateway exposes two WebSocket routes, and **each one, on its
