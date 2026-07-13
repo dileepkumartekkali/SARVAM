@@ -332,14 +332,16 @@ its own docs say so too.
 7. **Cross-service distributed tracing isn't linked** — spans are correct
    *within* each service; W3C trace-context propagation between the gateway
    and backend isn't wired.
-8. **Grok (Groq-hosted Llama 3.3 70B) is not officially multilingual across
-   all 13 Indic languages** — Meta's published support list for Llama 3.3
-   covers English/French/German/Hindi/Italian/Portuguese/Spanish/Thai, not
-   Telugu/Tamil/Kannada/Malayalam/Marathi/Gujarati/Punjabi/Bengali/Odia/
-   Assamese/Urdu. Sarvam (purpose-built for all 13 + code-mixing) is the
-   primary LLM provider precisely because of this gap; Grok is only reached
-   if Sarvam's own LLM call fails, so this risk is rare in practice but real
-   — a Sarvam outage could produce a lower-quality or English-language reply
-   to a non-Hindi Indic-language question until Sarvam recovers.
+8. **Grok (Groq-hosted Llama 3.3 70B), the primary LLM provider, is not
+   officially multilingual across all 13 Indic languages** — Meta's
+   published support list for Llama 3.3 covers English/French/German/Hindi/
+   Italian/Portuguese/Spanish/Thai, not Telugu/Tamil/Kannada/Malayalam/
+   Marathi/Gujarati/Punjabi/Bengali/Odia/Assamese/Urdu. Grok is primary for
+   latency; Sarvam (purpose-built for all 13 + code-mixing) is the fallback
+   whenever Grok's own call fails, but since Grok is the default path for
+   *every* turn, a non-Hindi Indic-language question may get a lower-quality
+   or English-language reply from Grok directly, not just during a Sarvam
+   outage. Swap `LLM_PROVIDER_ORDER` to put `sarvam` first if that quality
+   risk outweighs the latency win.
 
 # SARVAM

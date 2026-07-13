@@ -14,13 +14,14 @@ from .providers.anthropic import AnthropicProvider
 from .providers.gemini import GeminiProvider
 from .providers.openai_compatible import OpenAICompatibleProvider
 
-# Sarvam primary by explicit product choice — it's the multilingual model
-# (13 Indic languages + code-mixing), which is the whole point of this
-# assistant; Grok is faster but is only a fallback if Sarvam itself fails.
-# Gemini kept at the end (Google Cloud quota is confirmed dead — every model
-# 404s/429s) in case it's ever fixed; harmless there since it's only reached
-# if both Sarvam and Grok fail.
-_DEFAULT_ORDER = "sarvam,grok,gemini,claude,gpt"
+# Grok primary by explicit product choice (latency over Sarvam's reasoning
+# overhead) — accepted tradeoff: Grok (Groq-hosted Llama 3.3) does not
+# officially support most of the 13 Indic languages (only Hindi among them,
+# per Meta's published list), so non-Hindi Indic-language replies fall
+# through to Sarvam (the actually-multilingual model) whenever Grok's own
+# call fails. Gemini kept at the end (Google Cloud quota is confirmed dead
+# — every model 404s/429s) in case it's ever fixed.
+_DEFAULT_ORDER = "grok,sarvam,gemini,claude,gpt"
 
 
 def _build_provider(name: str) -> LLMProvider:

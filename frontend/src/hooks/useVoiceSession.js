@@ -21,14 +21,14 @@ async function saveReplyAudio({ userId, messageServerId, blob, onSaved }) {
   onSaved?.(messageServerId, path);
 }
 
-// THE one stop rule: 3 seconds of continuous silence ends listening —
+// THE one stop rule: 2.5 seconds of continuous silence ends listening —
 // whether the user never spoke at all, or spoke and then went quiet. Every
 // voiced frame resets this timer. Deliberately NOT stopping on Sarvam's
 // per-segment `speech_end` anymore: that fires on brief mid-sentence pauses
 // too, and cutting there ends the question early. Instead, transcript
 // segments ACCUMULATE across pauses and everything said gets joined into
-// one question when the 3s of real silence finally lands.
-const SILENCE_STOP_MS = 3000;
+// one question when the 2.5s of real silence finally lands.
+const SILENCE_STOP_MS = 2500;
 
 // After the 3s silence stop, the LAST speech segment's transcript may still
 // be in flight from Sarvam (it follows speech_end by up to ~1-2s). The
@@ -385,7 +385,7 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
       return;
     }
 
-    // The ONE stop rule starts counting from here: 3s of silence — whether
+    // The ONE stop rule starts counting from here: 2.5s of silence — whether
     // the user never speaks (mic stops, nothing was ever sent anywhere) or
     // speaks and then goes quiet (their whole question is finalized).
     resetSilenceTimer();
@@ -410,5 +410,14 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
     }
   }, [startListening, stopListening, setVoiceState]);
 
-  return { toggle, send };
+  // Switching modes (e.g. Speech to Text -> Speech to Speech) doesn't itself
+  // stop an in-progress voice session — without this, the orb kept showing
+  // "Listening…"/"Speaking…" in the newly-selected mode because nothing
+  // reset it. Call on every mode change; a no-op when already idle.
+  const reset = useCallback(() => {
+    stopListening();
+    setVoiceState(VoiceState.IDLE);
+  }, [stopListening, setVoiceState]);
+
+  return { toggle, send, reset };
 }

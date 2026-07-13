@@ -3,11 +3,12 @@
 from agent_core.llm_adapter.config import build_router_from_env, provider_order
 
 
-def test_default_order_has_sarvam_primary_with_all_others_as_fallback(monkeypatch):
-    """Sarvam primary by product choice — it's the multilingual model this
-    assistant is built around. Grok is the fast fallback if Sarvam fails."""
+def test_default_order_has_grok_primary_with_all_others_as_fallback(monkeypatch):
+    """Grok primary by product choice (latency). Sarvam (the actually
+    multilingual model) is the fallback for non-Hindi Indic languages Grok
+    doesn't officially support."""
     monkeypatch.delenv("LLM_PROVIDER_ORDER", raising=False)
-    assert provider_order() == ["sarvam", "grok", "gemini", "claude", "gpt"]
+    assert provider_order() == ["grok", "sarvam", "gemini", "claude", "gpt"]
 
 
 def test_env_var_swaps_primary_with_no_code_change(monkeypatch):

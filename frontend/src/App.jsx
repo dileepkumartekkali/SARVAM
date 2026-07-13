@@ -61,7 +61,16 @@ export default function App() {
     logout();
   }
 
-  const { toggle: onVoiceToggle, send: sendViaHook } = useVoiceSession({ token, ids, onUnauthorized: handleLogout });
+  const {
+    toggle: onVoiceToggle,
+    send: sendViaHook,
+    reset: resetVoice,
+  } = useVoiceSession({ token, ids, onUnauthorized: handleLogout });
+
+  function handleModeChange(newMode) {
+    resetVoice(); // stop a stale voice session bleeding "Listening…" into the newly-selected mode
+    setMode(newMode);
+  }
 
   // Supabase owns the session's lifecycle (storage, refresh) — this just
   // mirrors its current session into the app store. Fires once on mount with
@@ -236,7 +245,7 @@ export default function App() {
       <ChatView messages={messages} loading={!conversationReady} />
       <Composer
         mode={mode}
-        onModeChange={setMode}
+        onModeChange={handleModeChange}
         onSend={handleSend}
         voiceState={voiceState}
         bargeInSignal={bargeInSignal}
