@@ -7,6 +7,7 @@ WebSocket routes live in the Speech Gateway (its own service).
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -14,14 +15,19 @@ from typing import Literal
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from ..agents.language_agent import LOW_CONFIDENCE_THRESHOLD, detect_language
+from ..agents.task_agent import CLARIFYING_QUESTION, stream_turn
+from ..agents.translation_policy import decide_translation
 from ..llm_adapter import build_router_from_env
 from ..observability.logging_config import configure_logging
 from ..observability.metrics import metrics_response
 from ..observability.tracing import init_tracing
 from ..persistence import chat_store
 from ..security.auth import Principal, get_current_principal
+from ..security.confirmation import ConfirmationGate
 from ..supervisor.graph import build_text_graph
 from ..supervisor.state import Mode, SessionState
 from ..tools import build_default_registry
@@ -76,6 +82,18 @@ _graph = build_text_graph(
     tool_manifest=_tool_registry.as_prompt_manifest(),
     write_scope_tools=_tool_registry.write_scope_names(),
 )
+
+# /chat/stream bypasses the graph (task_agent.stream_turn is called directly —
+# see its own module for why), so it can't use the graph's LangGraph
+# checkpointer for cross-turn history. This is its own equivalent, same
+# per-thread_id/cap-at-20 shape as supervisor/graph.py's _MAX_HISTORY_MESSAGES,
+# kept independent since production traffic uses one endpoint exclusively
+# (the other stays as a non-streaming reference for load_test.py/chaos_test.py).
+_STREAM_MAX_HISTORY_MESSAGES = 20
+_stream_history: dict[str, list[dict]] = {}
+# One gate for the process, not per-request — a confirmation issued on turn N
+# must still be redeemable on turn N+1 (same reasoning as build_text_graph's).
+_stream_confirmation_gate = ConfirmationGate() if _tool_registry.write_scope_names() else None
 
 
 def get_graph():
@@ -218,6 +236,109 @@ async def chat(
         ),
         message_id=assistant_message_id,
     )
+
+
+def _sse_event(payload: dict) -> str:
+    return f"data: {json.dumps(payload)}\n\n"
+
+
+@app.post("/chat/stream")
+async def chat_stream(req: ChatRequest, principal: Principal = Depends(get_current_principal)) -> StreamingResponse:
+    """Streams `{"type": "text_delta", "text": ...}` events as sentence-bounded
+    chunks become ready (task_agent.stream_turn), then one final `{"type":
+    "done", ...}` event shaped like ChatResponse's fields. See stream_turn's
+    own docstring for the accepted trade-offs (no correction-retry once
+    streaming has started; legacy TOOL_CALL: text convention only, not
+    native, for tool detection). The non-streaming `/chat` above is
+    untouched and still used by scripts/load_test.py and chaos_test.py.
+    """
+    persistence_on = chat_store.is_configured()
+    if persistence_on and await chat_store.get_conversation(req.conversation_id, principal.subject) is None:
+        raise HTTPException(status_code=404, detail="conversation not found")
+
+    async def event_stream():
+        session = SessionState(
+            session_id=req.session_id,
+            conversation_id=req.conversation_id,
+            thread_id=req.thread_id,
+            mode=Mode(req.mode),
+        )
+        lang_result = await detect_language(req.message, stt_hint=req.stt_language_hint, router=_router)
+        session = session.model_copy(
+            update={
+                "response_language": lang_result.language,
+                "language_confidence": lang_result.confidence,
+                "is_code_mixed": lang_result.is_code_mixed,
+                "translation_applied": decide_translation(lang_result.language),
+            }
+        )
+
+        # Mirrors graph.py's route_after_language — never call the LLM at all
+        # on low-confidence input, ask a deterministic clarifying question.
+        if (lang_result.confidence or 0.0) < LOW_CONFIDENCE_THRESHOLD:
+            final_text = CLARIFYING_QUESTION
+            self_check_ok = True
+            pending = None
+            yield _sse_event({"type": "text_delta", "text": final_text})
+        else:
+            history = _stream_history.get(req.thread_id, [])
+            final_event = None
+            async for event in stream_turn(
+                session,
+                _router,
+                req.message,
+                tools=_tool_registry.as_dispatch_dict(),
+                tool_definitions=_tool_registry.as_tool_definitions(),
+                tool_manifest=_tool_registry.as_prompt_manifest(),
+                write_scope_tools=_tool_registry.write_scope_names(),
+                confirmation_gate=_stream_confirmation_gate,
+                confirmation_token=req.confirmation_token,
+                history=history,
+            ):
+                if event["type"] == "text_delta":
+                    yield _sse_event(event)
+                else:
+                    final_event = event
+            final_text = final_event["text"]
+            self_check_ok = final_event["self_check_ok"]
+            pending = final_event.get("pending_confirmation")
+            # Clarify turns are deliberately NOT added to history, matching
+            # graph.py's clarify_node (which never touches the "history" key).
+            _stream_history[req.thread_id] = (
+                history + [{"role": "user", "content": req.message}, {"role": "assistant", "content": final_text}]
+            )[-_STREAM_MAX_HISTORY_MESSAGES:]
+
+        assistant_message_id = None
+        if persistence_on:
+            assistant_message_id = str(uuid.uuid4())
+            asyncio.create_task(
+                chat_store.record_turn(
+                    req.conversation_id,
+                    principal.subject,
+                    req.message,
+                    final_text,
+                    session.response_language,
+                    assistant_message_id,
+                )
+            )
+
+        yield _sse_event(
+            {
+                "type": "done",
+                "message_id": assistant_message_id,
+                "response_language": session.response_language,
+                "language_confidence": session.language_confidence,
+                "is_code_mixed": session.is_code_mixed,
+                "self_check_ok": self_check_ok,
+                "pending_confirmation": (
+                    {"token": pending.token, "tool_name": pending.tool_name, "args": pending.args}
+                    if pending is not None
+                    else None
+                ),
+            }
+        )
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 class StoredMessage(BaseModel):

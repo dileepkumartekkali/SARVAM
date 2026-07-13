@@ -17,12 +17,13 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Sequence
+from typing import Awaitable, Callable, AsyncIterator, Sequence
 
 from ..llm_adapter.base import LLMProviderError, LLMRouter, Message, ToolCall, ToolDefinition
 from ..observability.tracing import start_span
 from ..security.confirmation import ConfirmationGate, PendingConfirmation
 from ..security.output_validation import sanitize_llm_output
+from ..speech.chunker import chunk_stream
 from ..supervisor.state import Mode, SessionState
 from .cancellation import CancellationToken, TurnCancelled
 from .language_agent import LANGUAGE_NAMES
@@ -260,6 +261,162 @@ async def _self_check(
     if reply.upper().startswith("OK"):
         return True, ""
     return False, reply
+
+
+# --- Streaming path (stream_turn) --------------------------------------------
+# Real trade-offs vs. run_turn(), accepted deliberately (see docs/SAD.md):
+# once a chunk has gone out it may already be playing as audio, so (1) a
+# self-check failure on a streamed turn is logged, never corrected by
+# re-generating and re-speaking a different draft, and (2) tool detection on
+# the streamed path uses only the legacy `TOOL_CALL:` text convention
+# (`_parse_tool_call`'s own convention) rather than native structured tool
+# calls, since a provider's token-streaming mode doesn't carry those.
+
+_TOOL_CALL_SNIFF_CHARS = 40  # enough to recognize "TOOL_CALL:" as the whole reply, never mid-prose
+
+
+class _ToolCallDetected(Exception):
+    """Raised by `_sniff_and_forward` before anything is yielded downstream —
+    signals stream_turn to abandon streaming and hand the whole turn to
+    run_turn() instead, unmodified, for real native tool-calling."""
+
+
+async def _sniff_and_forward(raw_stream: AsyncIterator[str]) -> AsyncIterator[str]:
+    """Buffers the first ~40 chars (or first line) of a raw token stream
+    before forwarding anything, so a `TOOL_CALL: {...}` response — always a
+    standalone reply by prompt convention, never buried after real prose —
+    is caught before any of it is ever shown or spoken."""
+    buffered = ""
+    sniffed = False
+    async for delta in raw_stream:
+        if sniffed:
+            yield delta
+            continue
+        buffered += delta
+        if "\n" in buffered or len(buffered) >= _TOOL_CALL_SNIFF_CHARS:
+            sniffed = True
+            if buffered.lstrip().startswith("TOOL_CALL:"):
+                raise _ToolCallDetected()
+            yield buffered
+    if not sniffed:
+        # Stream ended before hitting the sniff threshold (a very short reply).
+        if buffered.lstrip().startswith("TOOL_CALL:"):
+            raise _ToolCallDetected()
+        if buffered:
+            yield buffered
+
+
+async def stream_turn(
+    session: SessionState,
+    router: LLMRouter,
+    user_message: str,
+    *,
+    tools: dict[str, ToolFn] | None = None,
+    tool_definitions: Sequence[ToolDefinition] | None = None,
+    max_tool_calls: int = 3,
+    prompt_version: str = "v1",
+    write_scope_tools: set[str] | None = None,
+    confirmation_gate: ConfirmationGate | None = None,
+    confirmation_token: str | None = None,
+    tool_manifest: str = "",
+    history: Sequence[Message] | None = None,
+) -> AsyncIterator[dict]:
+    """Streaming counterpart to `run_turn` — yields `{"type": "text_delta",
+    "text": ...}` events as sentence-bounded chunks become ready (via the
+    same `chunk_stream` the Speech Gateway already uses), then one final
+    `{"type": "done", ...}` event shaped like `TurnResult`'s fields.
+
+    Falls back to the complete, unmodified `run_turn()` the instant a
+    `TOOL_CALL:` prefix is sniffed — nothing has been yielded yet at that
+    point, so nothing shown/spoken is ever wrong or duplicated; that turn
+    just doesn't get the streaming speedup (accepted — tool-using turns are
+    the minority and native tool-calling correctness matters more there).
+    """
+    system_prompt, version_id = _build_system_prompt(session, version=prompt_version, tool_manifest=tool_manifest)
+    directive = _turn_directive(session, user_message)
+    expected_script = _expected_script(session, user_message)
+    initial_message = f"{directive}\n\n{user_message}" if directive else user_message
+    messages: list[Message] = [*(history or []), {"role": "user", "content": initial_message}]
+
+    with start_span("task_agent", "task_agent.stream_turn", mode=session.mode.value, prompt_version=version_id):
+        accumulated: list[str] = []
+        try:
+            raw_stream = router.stream_with_fallback(messages, system=system_prompt)
+            async for chunk in chunk_stream(_sniff_and_forward(raw_stream)):
+                accumulated.append(chunk)
+                yield {"type": "text_delta", "text": chunk}
+        except _ToolCallDetected:
+            result = await run_turn(
+                session,
+                router,
+                user_message,
+                tools=tools,
+                tool_definitions=tool_definitions,
+                max_tool_calls=max_tool_calls,
+                prompt_version=prompt_version,
+                write_scope_tools=write_scope_tools,
+                confirmation_gate=confirmation_gate,
+                confirmation_token=confirmation_token,
+                tool_manifest=tool_manifest,
+                history=history,
+            )
+            yield {"type": "text_delta", "text": result.text}
+            yield {
+                "type": "done",
+                "text": result.text,
+                "prompt_version": result.prompt_version,
+                "tool_call_count": result.tool_call_count,
+                "self_check_ok": result.self_check_ok,
+                "self_check_reason": result.self_check_reason,
+                "pending_confirmation": result.pending_confirmation,
+            }
+            return
+        except LLMProviderError:
+            logger.info("turn_trace", extra={"prompt_version": version_id, "provider_error": True, "streamed": True})
+            yield {"type": "text_delta", "text": LLM_UNAVAILABLE_APOLOGY}
+            yield {
+                "type": "done",
+                "text": LLM_UNAVAILABLE_APOLOGY,
+                "prompt_version": version_id,
+                "tool_call_count": 0,
+                "self_check_ok": True,
+                "self_check_reason": "",
+                "pending_confirmation": None,
+            }
+            return
+
+        draft = "".join(accumulated)
+        self_check_ok, self_check_reason = await _self_check(
+            draft,
+            session.mode,
+            router,
+            response_language=session.response_language,
+            is_code_mixed=session.is_code_mixed,
+            expected_script=expected_script,
+        )
+        # No correction-retry here, deliberately — see the module-level note
+        # above. A failure is logged so it's visible in traces, not silently
+        # dropped, but the already-streamed text stands as the shown/spoken
+        # output either way.
+        logger.info(
+            "turn_trace",
+            extra={
+                "prompt_version": version_id,
+                "tool_call_count": 0,
+                "self_check_ok": self_check_ok,
+                "self_check_reason": self_check_reason,
+                "streamed": True,
+            },
+        )
+        yield {
+            "type": "done",
+            "text": sanitize_llm_output(draft),
+            "prompt_version": version_id,
+            "tool_call_count": 0,
+            "self_check_ok": self_check_ok,
+            "self_check_reason": self_check_reason,
+            "pending_confirmation": None,
+        }
 
 
 async def run_turn(
