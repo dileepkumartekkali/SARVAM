@@ -8,6 +8,19 @@ import { ConnectionState, Mode, VoiceState, useAppStore } from "../store/useAppS
 
 const TTS_AUDIO_BUCKET = "tts-audio";
 
+// The speech-gateway is its own Render service and sleeps independently of
+// the backend — a cold start (or any network hiccup) meant the TTS socket's
+// "open"/"close" events could simply never fire, and with no timeout
+// anywhere, `await`ing them hung the whole turn forever: the composer stayed
+// disabled permanently since the promise chain that resets it never
+// resolved. Real bug hit live. These bound how long a stuck socket can block.
+const TTS_OPEN_TIMEOUT_MS = 8000;
+const TTS_CLOSE_TIMEOUT_MS = 20000;
+
+function withTimeout(promise, ms) {
+  return Promise.race([promise, new Promise((resolve) => setTimeout(resolve, ms))]);
+}
+
 /** Uploads a finished TTS reply's audio so it can be replayed later, and
  * attaches it to the message row (RLS-scoped update — same pattern as the
  * upload path itself, no backend round-trip needed for either). Best-effort:
@@ -156,20 +169,31 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
         },
       });
       const ws = socket.connectTTS({ language: ttsLanguage, model: "bulbul:v3" });
-      const opened = new Promise((resolve) => ws.addEventListener("open", resolve));
-      const closed = new Promise((resolve) => {
-        ws.addEventListener("close", resolve); // /ws/tts closes once the utterance is fully synthesized
-        ws.addEventListener("error", resolve);
-      });
+      const opened = withTimeout(
+        new Promise((resolve) => ws.addEventListener("open", resolve)),
+        TTS_OPEN_TIMEOUT_MS
+      );
+      const closed = withTimeout(
+        new Promise((resolve) => {
+          ws.addEventListener("close", resolve); // /ws/tts closes once the utterance is fully synthesized
+          ws.addEventListener("error", resolve);
+        }),
+        TTS_CLOSE_TIMEOUT_MS
+      );
       return {
         async sendChunk(chunk) {
           await opened;
-          socket.sendText(chunk);
+          // Guards against the timeout (not a real "open") having resolved
+          // this — sendText already no-ops if the socket isn't OPEN, but
+          // being explicit here documents why that matters.
+          if (ws.readyState === WebSocket.OPEN) socket.sendText(chunk);
         },
         async finish() {
           await opened;
-          socket.endTTSUtterance();
-          await closed;
+          if (ws.readyState === WebSocket.OPEN) {
+            socket.endTTSUtterance();
+            await closed;
+          }
           setVoiceState(VoiceState.IDLE);
           return player.finish();
         },
