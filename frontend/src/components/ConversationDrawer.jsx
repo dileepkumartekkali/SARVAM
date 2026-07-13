@@ -74,6 +74,12 @@ export default function ConversationDrawer({
 }) {
   if (!open) return null;
 
+  // A conversation with no messages yet has `title: null` (see
+  // chat_store.list_conversations) -- a "New chat" that was opened but never
+  // used shouldn't clutter the list. It's still fully functional as the
+  // active draft, just not shown here until it actually has something in it.
+  const usedConversations = conversations.filter((c) => c.title);
+
   return (
     <div className="conversation-drawer-overlay" onClick={onClose}>
       <div className="conversation-drawer" onClick={(e) => e.stopPropagation()}>
@@ -91,7 +97,7 @@ export default function ConversationDrawer({
           New chat
         </button>
         <div className="conversation-drawer__list">
-          {conversations.map((c) => (
+          {usedConversations.map((c) => (
             <ConversationRow
               key={c.id}
               conversation={c}
@@ -103,7 +109,7 @@ export default function ConversationDrawer({
               onDelete={() => onDeleteConversation(c.id)}
             />
           ))}
-          {conversations.length === 0 && <div className="conversation-drawer__empty">No conversations yet</div>}
+          {usedConversations.length === 0 && <div className="conversation-drawer__empty">No conversations yet</div>}
         </div>
       </div>
     </div>
