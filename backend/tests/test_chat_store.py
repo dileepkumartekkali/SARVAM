@@ -27,6 +27,19 @@ class _FakeConnection:
             row = {"id": uuid.uuid4(), "user_id": user_id, "updated_at": datetime.datetime.now(datetime.timezone.utc)}
             self._conversations[row["id"]] = row
             return row
+        if query.startswith("insert into messages (id,"):
+            message_id, conversation_id, user_id, role, content, response_language = args
+            row = {
+                "id": message_id,
+                "conversation_id": conversation_id,
+                "user_id": user_id,
+                "role": role,
+                "content": content,
+                "audio_path": None,
+                "response_language": response_language,
+            }
+            self._messages.append(row)
+            return row
         if query.startswith("insert into messages"):
             conversation_id, user_id, role, content, response_language = args
             row = {
@@ -173,6 +186,30 @@ async def test_messages_are_scoped_to_owning_user(fake_pool):
     # this is the ownership check that matters since the backend's own
     # connection bypasses RLS (trusted server-side query, not PostgREST).
     assert await chat_store.list_messages(alice_conversation, bob) == []
+
+
+async def test_record_turn_persists_both_sides_with_the_given_assistant_id(fake_pool):
+    user_id = str(uuid.uuid4())
+    conversation_id = await chat_store.create_conversation(user_id)
+    assistant_message_id = str(uuid.uuid4())
+
+    await chat_store.record_turn(conversation_id, user_id, "hi there", "hello!", "en", assistant_message_id)
+
+    messages = await chat_store.list_messages(conversation_id, user_id)
+    assert [(m["role"], m["content"]) for m in messages] == [("user", "hi there"), ("assistant", "hello!")]
+    assert str(messages[1]["id"]) == assistant_message_id
+
+
+async def test_record_turn_swallows_errors_without_raising(fake_pool, monkeypatch, caplog):
+    async def _boom(*a, **k):
+        raise RuntimeError("db exploded")
+
+    monkeypatch.setattr(chat_store, "insert_message", _boom)
+
+    # Must not raise -- this runs as a background task after the user
+    # already got their answer; a persistence failure can't become a 500.
+    await chat_store.record_turn(str(uuid.uuid4()), str(uuid.uuid4()), "hi", "hello", "en", str(uuid.uuid4()))
+    assert "record_turn failed" in caplog.text
 
 
 async def test_delete_conversation_removes_it_and_its_messages(fake_pool):

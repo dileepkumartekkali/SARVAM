@@ -173,12 +173,21 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
           isCodeMixed: result.is_code_mixed,
         });
         if (result.message_id) setMessageServerId(assistantId, result.message_id);
-        await revealProgressively(result.response, (chunk) => appendToMessage(assistantId, chunk));
-        finishMessage(assistantId);
 
         if (mode === Mode.SPEECH_TO_SPEECH || mode === Mode.TEXT_TO_SPEECH) {
-          await speakReply(result.response, result.response_language, result.message_id);
+          // TTS synthesis (real network + audio time) used to wait for the
+          // word-by-word text reveal to finish first, purely because they
+          // were two sequential `await`s — pure wasted time before the user
+          // heard anything. Running them together means the reply is both
+          // visible and audible as soon as possible, not one after the other.
+          await Promise.all([
+            revealProgressively(result.response, (chunk) => appendToMessage(assistantId, chunk)),
+            speakReply(result.response, result.response_language, result.message_id),
+          ]);
+          finishMessage(assistantId);
         } else {
+          await revealProgressively(result.response, (chunk) => appendToMessage(assistantId, chunk));
+          finishMessage(assistantId);
           setVoiceState(VoiceState.IDLE);
         }
       } catch (err) {

@@ -6,11 +6,13 @@ WebSocket routes live in the Speech Gateway (its own service).
 
 from __future__ import annotations
 
+import asyncio
 import os
+import uuid
 from contextlib import asynccontextmanager
 from typing import Literal
 
-from fastapi import Depends, FastAPI, HTTPException, Response
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -137,6 +139,7 @@ class ChatResponse(BaseModel):
 @app.post("/chat", response_model=ChatResponse)
 async def chat(
     req: ChatRequest,
+    background_tasks: BackgroundTasks,
     graph=Depends(get_graph),
     principal: Principal = Depends(get_current_principal),
 ) -> ChatResponse:
@@ -146,29 +149,58 @@ async def chat(
         thread_id=req.thread_id,
         mode=Mode(req.mode),
     )
-    conversation_id = None
-    if chat_store.is_configured():
-        if await chat_store.get_conversation(req.conversation_id, principal.subject) is None:
-            raise HTTPException(status_code=404, detail="conversation not found")
-        conversation_id = req.conversation_id
-        await chat_store.insert_message(conversation_id, principal.subject, "user", req.message)
+    persistence_on = chat_store.is_configured()
 
-    result = await graph.ainvoke(
-        {
-            "session": session,
-            "user_message": req.message,
-            "stt_language_hint": req.stt_language_hint,
-            "confirmation_token": req.confirmation_token,
-        },
-        config={"configurable": {"thread_id": req.thread_id}},
-    )
+    # The ownership check is a DB round-trip that has nothing to do with what
+    # the LLM produces -- running it concurrently with graph.ainvoke() (not
+    # before it) hides its latency entirely behind the LLM call, which is
+    # always far longer. A wasted LLM call only happens in the (never
+    # expected in normal use) case of a bogus/foreign conversation_id.
+    owned_check = chat_store.get_conversation(req.conversation_id, principal.subject) if persistence_on else None
+    if owned_check is not None:
+        owned, result = await asyncio.gather(
+            owned_check,
+            graph.ainvoke(
+                {
+                    "session": session,
+                    "user_message": req.message,
+                    "stt_language_hint": req.stt_language_hint,
+                    "confirmation_token": req.confirmation_token,
+                },
+                config={"configurable": {"thread_id": req.thread_id}},
+            ),
+        )
+        if owned is None:
+            raise HTTPException(status_code=404, detail="conversation not found")
+    else:
+        result = await graph.ainvoke(
+            {
+                "session": session,
+                "user_message": req.message,
+                "stt_language_hint": req.stt_language_hint,
+                "confirmation_token": req.confirmation_token,
+            },
+            config={"configurable": {"thread_id": req.thread_id}},
+        )
+
     detected_session: SessionState = result["session"]
     pending = result.get("pending_confirmation")
 
+    # Persisting both sides of the turn is durability, not something the
+    # caller is waiting on -- it runs as a background task AFTER the response
+    # below is already sent. The id is generated here (not by Postgres) so it
+    # can be returned immediately for the audio-replay upload to target.
     assistant_message_id = None
-    if conversation_id is not None:
-        assistant_message_id = await chat_store.insert_message(
-            conversation_id, principal.subject, "assistant", result["response"], detected_session.response_language
+    if persistence_on:
+        assistant_message_id = str(uuid.uuid4())
+        background_tasks.add_task(
+            chat_store.record_turn,
+            req.conversation_id,
+            principal.subject,
+            req.message,
+            result["response"],
+            detected_session.response_language,
+            assistant_message_id,
         )
 
     return ChatResponse(
