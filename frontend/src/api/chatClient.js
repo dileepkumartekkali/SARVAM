@@ -1,4 +1,23 @@
 import { API_BASE_URL } from "./config";
+import { supabase } from "./supabaseClient";
+
+// A tab left open/backgrounded for hours outlives Supabase's ~1h access
+// token — supabase-js's autoRefreshToken is timer-driven and browsers
+// throttle timers in background tabs, so the token can go stale before it
+// refreshes on its own. Every call below used to treat the very next 401 as
+// "really logged out" and sign the user out immediately. Real bug hit live:
+// this is the one shared place that instead tries a real refresh first and
+// retries once — only a 401 that survives a fresh token is a real logout.
+async function fetchWithAuthRetry(url, options, token) {
+  const withAuth = (t) => ({ ...options, headers: { ...options.headers, Authorization: `Bearer ${t}` } });
+  let resp = await fetch(url, withAuth(token));
+  if (resp.status === 401) {
+    const { data } = await supabase.auth.refreshSession();
+    const refreshedToken = data?.session?.access_token;
+    if (refreshedToken) resp = await fetch(url, withAuth(refreshedToken));
+  }
+  return resp;
+}
 
 /**
  * `POST /chat/stream` (agent_core.api.main + task_agent.stream_turn) — real
@@ -17,21 +36,22 @@ export async function streamChatMessage(
   { message, mode, sessionId, conversationId, threadId, token, sttLanguageHint },
   { onLanguage, onTextDelta, onDone }
 ) {
-  const resp = await fetch(`${API_BASE_URL}/chat/stream`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
+  const resp = await fetchWithAuthRetry(
+    `${API_BASE_URL}/chat/stream`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: sessionId,
+        conversation_id: conversationId,
+        thread_id: threadId,
+        message,
+        mode: mode || "text_to_text",
+        stt_language_hint: sttLanguageHint ?? null,
+      }),
     },
-    body: JSON.stringify({
-      session_id: sessionId,
-      conversation_id: conversationId,
-      thread_id: threadId,
-      message,
-      mode: mode || "text_to_text",
-      stt_language_hint: sttLanguageHint ?? null,
-    }),
-  });
+    token
+  );
   if (resp.status === 401) {
     const err = new Error("unauthorized");
     err.status = 401;
@@ -81,9 +101,7 @@ function _unauthorizedOr(resp, message) {
  * chat_store.py) — ordered most-recently-active first, what populates the
  * conversation switcher/sidebar. */
 export async function listConversations(token) {
-  const resp = await fetch(`${API_BASE_URL}/conversations`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
+  const resp = await fetchWithAuthRetry(`${API_BASE_URL}/conversations`, {}, token);
   const err = _unauthorizedOr(resp, "listing conversations failed");
   if (err) throw err;
   return resp.json();
@@ -91,10 +109,7 @@ export async function listConversations(token) {
 
 /** Starts a new, empty conversation — returns `{id}`. */
 export async function createConversation(token) {
-  const resp = await fetch(`${API_BASE_URL}/conversations`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${token}` },
-  });
+  const resp = await fetchWithAuthRetry(`${API_BASE_URL}/conversations`, { method: "POST" }, token);
   const err = _unauthorizedOr(resp, "creating conversation failed");
   if (err) throw err;
   return resp.json();
@@ -104,9 +119,7 @@ export async function createConversation(token) {
  * the active conversation is switched, so a page refresh (or a switch back
  * to an older chat) doesn't lose what's already been said. */
 export async function fetchConversationMessages(token, conversationId) {
-  const resp = await fetch(`${API_BASE_URL}/conversations/${conversationId}/messages`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
+  const resp = await fetchWithAuthRetry(`${API_BASE_URL}/conversations/${conversationId}/messages`, {}, token);
   const err = _unauthorizedOr(resp, "fetching conversation messages failed");
   if (err) throw err;
   return resp.json();
@@ -116,10 +129,7 @@ export async function fetchConversationMessages(token, conversationId) {
  * see chat_store.delete_conversation). Does not remove any replay audio
  * already uploaded to Supabase Storage for it. */
 export async function deleteConversation(token, conversationId) {
-  const resp = await fetch(`${API_BASE_URL}/conversations/${conversationId}`, {
-    method: "DELETE",
-    headers: { Authorization: `Bearer ${token}` },
-  });
+  const resp = await fetchWithAuthRetry(`${API_BASE_URL}/conversations/${conversationId}`, { method: "DELETE" }, token);
   const err = _unauthorizedOr(resp, "deleting conversation failed");
   if (err) throw err;
 }
