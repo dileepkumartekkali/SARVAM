@@ -22,11 +22,14 @@ from __future__ import annotations
 import asyncio
 from typing import AsyncIterator, Awaitable, Callable
 
-from ..agents.task_agent import CLARIFYING_QUESTION
+from ..agents.task_agent import CLARIFYING_QUESTION, LLM_UNAVAILABLE_APOLOGY
 
 TRANSCRIPT_CONFIDENCE_THRESHOLD = 0.4
 
-LLM_TIMEOUT_APOLOGY = "I'm having trouble getting an answer right now — let me get back to you in a moment."
+# Reused rather than duplicated — task_agent.py had its own independently
+# hand-written copy of this same line until this was caught in a pre-deploy
+# sweep; two apologies for the same failure meant they could silently drift.
+LLM_TIMEOUT_APOLOGY = LLM_UNAVAILABLE_APOLOGY
 TTS_FAILURE_APOLOGY = "I'm having trouble with audio right now."
 
 # Reused rather than duplicated — a low-confidence transcript and a
