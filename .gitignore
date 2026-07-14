@@ -22,3 +22,6 @@ Thumbs.db
 # Load/chaos test artifacts
 load_test_results/
 *.chaos.log
+
+# Local dev-server run scripts/output — machine-specific, not for the repo
+logs/
