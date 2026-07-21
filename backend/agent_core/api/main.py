@@ -31,6 +31,7 @@ from ..security.confirmation import ConfirmationGate
 from ..supervisor.graph import build_text_graph
 from ..supervisor.state import Mode, SessionState
 from ..tools import build_default_registry
+from ..tools.rag_tool import build_rag_tool_spec, is_available as rag_is_available
 
 configure_logging()
 init_tracing("backend")
@@ -75,6 +76,11 @@ else:
 
 # Real tools, not an empty namespace — see agent_core/tools/builtin.py.
 _tool_registry = build_default_registry()
+# Only registered when both HF_API_TOKEN and POSTGRES_DSN are set — same
+# "optional at runtime, no-op otherwise" convention as chat_store.py, so a
+# deploy without RAG configured still boots and answers normally.
+if rag_is_available():
+    _tool_registry.register(build_rag_tool_spec())
 _graph = build_text_graph(
     _router,
     tools=_tool_registry.as_dispatch_dict(),
