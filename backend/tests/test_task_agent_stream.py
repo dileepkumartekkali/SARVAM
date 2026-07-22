@@ -85,6 +85,31 @@ async def test_stream_turn_forces_retrieval_when_message_names_the_company():
     assert "REAL FACT" in str(provider.messages_by_call[0])
 
 
+async def test_stream_turn_survives_forced_retrieval_raising_unexpectedly():
+    """Defense in depth: forced retrieval runs BEFORE any LLM call in
+    stream_turn. Even though search_company_knowledge already catches its
+    own known failure modes, this proves stream_turn itself never crashes
+    if the registered tool raises something completely unexpected --
+    degrading to "no forced context" and answering normally instead."""
+    provider = ScriptedProvider(["I don't have that information handy.", "OK"])
+    router = LLMRouter([provider])
+
+    async def broken_search(query: str) -> str:
+        raise RuntimeError("totally unexpected failure")
+
+    events = [
+        e async for e in stream_turn(
+            _session(), router, "who is the mtouch labs ceo",
+            tools={"search_company_knowledge": broken_search},
+        )
+    ]
+
+    done = events[-1]
+    assert done["type"] == "done"
+    assert done["tool_call_count"] == 0  # forced retrieval failed -> not counted as tool-backed
+    assert done["text"] == "I don't have that information handy."
+
+
 async def test_stream_turn_does_not_force_retrieval_when_company_not_named():
     provider = ScriptedProvider(["I don't have that information.", "OK"])
     router = LLMRouter([provider])

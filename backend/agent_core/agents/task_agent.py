@@ -210,7 +210,18 @@ async def _forced_company_context(user_message: str, tools: dict[str, ToolFn] | 
         return None
     if _FORCED_RETRIEVAL_KEYWORD not in user_message.lower().replace(" ", ""):
         return None
-    return await tools[_FORCED_RETRIEVAL_TOOL_NAME](query=user_message)
+    try:
+        return await tools[_FORCED_RETRIEVAL_TOOL_NAME](query=user_message)
+    except Exception:  # noqa: BLE001 -- this runs BEFORE any LLM call in
+        # both run_turn and stream_turn; search_company_knowledge already
+        # catches its own known failure modes and returns an error string
+        # instead of raising, but this call happens unconditionally for
+        # every "mtouch" message -- a defense-in-depth guard here (not
+        # relying solely on the tool's own internal handling) means a truly
+        # unexpected failure degrades to "no forced context" rather than
+        # crashing the entire turn before a single token was generated.
+        logger.exception("forced_company_context failed unexpectedly")
+        return None
 
 
 def _with_forced_context(user_message: str, forced_context: str | None) -> str:

@@ -75,7 +75,17 @@ async def search_company_knowledge(query: str) -> str:
         query_vector = await _embed_with_retry(query)
     except embeddings.EmbeddingError as e:
         return f"Error: couldn't search company knowledge right now ({e})."
-    results = await store.search(query_vector, top_k=_TOP_K)
+    try:
+        results = await store.search(query_vector, top_k=_TOP_K)
+    except Exception as e:  # noqa: BLE001 -- real gap: this call had NO handling at
+        # all (unlike the embedding call right above it). A genuine DB hiccup
+        # (connection drop, pool exhaustion) would crash uncaught -- and since
+        # task_agent._forced_company_context now calls this BEFORE any LLM
+        # call even runs, every message naming the company would crash the
+        # entire turn with zero fallback, worse than the embedding-failure
+        # case this function already handled. Same "tool failure is reported,
+        # never crashes the turn" contract as a normal tool exception.
+        return f"Error: couldn't search company knowledge right now (database error: {e})."
     if not results:
         return "No relevant company information found for that query."
     return "\n\n".join(f"[{r['page_title']} — {r['page_url']}]\n{r['text']}" for r in results)

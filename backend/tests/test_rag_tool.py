@@ -45,6 +45,27 @@ async def test_search_reports_no_results_plainly(monkeypatch):
     assert "no relevant" in result.lower()
 
 
+async def test_search_surfaces_a_database_failure_without_raising(monkeypatch):
+    """Real gap caught by a direct question about edge cases: store.search
+    had NO exception handling at all, unlike the embedding call right above
+    it. A genuine DB hiccup (connection drop, pool exhaustion) would crash
+    uncaught -- and since this now also runs as FORCED retrieval before any
+    LLM call, every message naming the company would crash the whole turn
+    with zero fallback."""
+    async def fake_embed_text(query, **kwargs):
+        return [0.1, 0.2]
+
+    async def fake_search(query_vector, *, top_k):
+        raise ConnectionError("connection to Postgres lost")
+
+    monkeypatch.setattr(rag_tool.embeddings, "embed_text", fake_embed_text)
+    monkeypatch.setattr(rag_tool.store, "search", fake_search)
+
+    result = await rag_tool.search_company_knowledge("who is the CEO")
+
+    assert "error" in result.lower()
+
+
 async def test_search_surfaces_embedding_failure_without_raising(monkeypatch):
     monkeypatch.setattr(rag_tool, "_RETRY_DELAY_SECONDS", 0)  # don't slow the suite down for a real retry wait
 
