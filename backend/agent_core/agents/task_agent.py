@@ -179,10 +179,25 @@ def _voice_brevity_directive(session: SessionState) -> str:
     """Reinforces the voice-mode system prompt's own LENGTH/FORMATTING
     sections right next to the query, same rationale as `_language_directive`
     — applies regardless of language, since a long, clause-heavy answer is
-    hard for any TTS voice to render clearly, not just a non-English one."""
+    hard for any TTS voice to render clearly, not just a non-English one.
+
+    Reported live: a multi-part question ("mtouch labs ceo evaru?python ante
+    enti?") got answered by restating each sub-question before its answer,
+    and the language/code-mixing style drifted from Telugish at the start
+    to plain English by the end of the same reply — inconsistent within a
+    single answer, not just wrong outright. This is a softer LLM-compliance
+    issue than the marker leak (a genuine code-level guarantee) — this is a
+    prompt reinforcement, not something that can be guaranteed the same
+    way; noted honestly, not oversold."""
     if not session.mode.is_voice:
         return ""
-    return "[Keep the answer short, simple, and clear — plain words, short sentences, easy to speak aloud naturally.]"
+    return (
+        "[Keep the answer short, simple, and clear — plain words, short sentences, "
+        "easy to speak aloud naturally. Answer directly — never restate or repeat "
+        "the question back before answering it. If multiple questions were asked, "
+        "answer each in turn without a header, and keep the SAME language and "
+        "code-mixing style consistent across the entire reply, not just the start.]"
+    )
 
 
 def _turn_directive(session: SessionState, user_message: str) -> str:
