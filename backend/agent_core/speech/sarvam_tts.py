@@ -28,9 +28,11 @@ import os
 from typing import AsyncIterator, Callable
 
 import websockets
+import websockets.exceptions
+
+from ..security.pii import mask_pii
 
 logger = logging.getLogger("agent_core.speech")
-import websockets.exceptions
 
 # How long to wait, after the last audio chunk for a flushed text message,
 # before deciding the server is done with it. Real-API testing found Sarvam
@@ -153,6 +155,10 @@ class SarvamTTSClient:
         pace: float | None = None,
     ) -> AsyncIterator[bytes]:
         config_data = self._config_data(language, model, voice=voice, pace=pace)
+        # Config itself carries no user text/PII -- safe to log in full, and
+        # this is exactly the payload Sarvam's own support needs if a request
+        # ID from this session ever needs escalating with them directly.
+        logger.info("Sarvam TTS config: %s", config_data)
         try:
             async with self._connect(
                 self._ws_url, additional_headers={"Authorization": f"Bearer {self._api_key()}"}
@@ -160,6 +166,7 @@ class SarvamTTSClient:
                 await ws.send(json.dumps({"type": "config", "data": config_data}))
 
                 async for text in text_chunks:
+                    logger.info("Sarvam TTS sending text chunk (%d chars): %s", len(text), mask_pii(text))
                     await ws.send(json.dumps({"type": "text", "data": {"text": text}}))
                     # Sarvam buffers text server-side (min_buffer_size, default
                     # 50 chars) and only synthesizes on a flush — our own
@@ -179,6 +186,11 @@ class SarvamTTSClient:
                                 ws.recv(), timeout=_CHUNK_IDLE_TIMEOUT_SECONDS if received_any_audio else 15.0
                             )
                         except asyncio.TimeoutError:
+                            logger.warning(
+                                "Sarvam TTS idle timeout waiting for a response to this chunk "
+                                "(received_any_audio=%s) -- treating as end of this chunk.",
+                                received_any_audio,
+                            )
                             break  # idle after audio — treat as this chunk's end (see module docstring)
                         event = json.loads(raw)
                         event_type = event.get("type")
@@ -198,8 +210,14 @@ class SarvamTTSClient:
                         elif event_type == "error":
                             raise TTSStreamError(f"Sarvam TTS error: {event.get('data')}")
                         elif event_type == "event" and event.get("data", {}).get("event_type") == "final":
+                            logger.info("Sarvam TTS: received explicit 'final' completion event")
                             break  # a real completion event, when Sarvam does send one
         except websockets.exceptions.ConnectionClosed as e:
+            logger.warning(
+                "Sarvam TTS WebSocket closed -- code=%s reason=%s",
+                getattr(e, "code", None), getattr(e, "reason", None),
+            )
             raise TTSStreamError(f"TTS stream connection closed: {e}") from e
         except OSError as e:
+            logger.warning("Sarvam TTS WebSocket connection failed: %s", e)
             raise TTSStreamError(f"TTS stream connection failed: {e}") from e
