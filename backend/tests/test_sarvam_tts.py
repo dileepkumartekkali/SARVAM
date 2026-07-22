@@ -122,5 +122,23 @@ async def test_pace_out_of_range_for_model_rejected():
     with pytest.raises(ValueError):
         SarvamTTSClient._config_data("hi", "bulbul:v3", voice=None, pace=2.5)  # v3 max is 2.0
 
+
+async def test_default_speaker_matches_the_selected_model():
+    """Real bug hit live, reported as "English is clear, Telugu is not":
+    the old single flat default speaker ("anushka") is bulbul:v2-only, but
+    every live call defaults to model="bulbul:v3" -- an invalid speaker/
+    model pair per Sarvam's own docs ("speaker selection must match the
+    chosen model version"). Each model must get a speaker that's actually
+    valid FOR that model when no explicit voice is requested."""
+    v3_data = SarvamTTSClient._config_data("hi", "bulbul:v3", voice=None, pace=None)
+    assert v3_data["speaker"] == "shubh"
+
+    v2_data = SarvamTTSClient._config_data("hi", "bulbul:v2", voice=None, pace=None)
+    assert v2_data["speaker"] == "anushka"
+
+    # An explicitly requested voice always wins over either default.
+    explicit = SarvamTTSClient._config_data("hi", "bulbul:v3", voice="priya", pace=None)
+    assert explicit["speaker"] == "priya"
+
     # Same pace is valid for v2 (range 0.3-3.0).
     SarvamTTSClient._config_data("hi", "bulbul:v2", voice=None, pace=2.5)

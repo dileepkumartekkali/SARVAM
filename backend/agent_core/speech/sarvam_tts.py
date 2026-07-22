@@ -69,7 +69,19 @@ _LANGUAGE_TO_SARVAM_CODE = {
     "en": "en-IN",
 }
 
-_DEFAULT_SPEAKER = "anushka"  # a real bulbul speaker name; Sarvam requires one
+# Real bug hit live, reported as "English is clear, Telugu is not": the old
+# single flat default ("anushka") is a bulbul:v2-ONLY speaker (confirmed
+# against Sarvam's real docs) -- but every live call in this app defaults to
+# model="bulbul:v3", whose speaker list doesn't include "anushka" at all.
+# Docs are explicit: "speaker selection must match the chosen model
+# version... no cross-model speaker usage." Every TTS call here has been
+# sending an invalid speaker/model pair, likely triggering some
+# undocumented fallback on Sarvam's side whose quality apparently isn't
+# consistent across languages. Made model-aware (matching this file's own
+# _PACE_RANGES pattern) rather than just picking a new flat default and
+# silently reintroducing the identical bug for bulbul:v2 -- that model has
+# no live call site today, but it IS a supported, tested path in this file.
+_DEFAULT_SPEAKERS = {"bulbul:v2": "anushka", "bulbul:v3": "shubh"}
 
 
 class TTSStreamError(Exception):
@@ -113,7 +125,7 @@ class SarvamTTSClient:
 
         data: dict = {
             "target_language_code": _LANGUAGE_TO_SARVAM_CODE.get(language, language),
-            "speaker": voice or _DEFAULT_SPEAKER,
+            "speaker": voice or _DEFAULT_SPEAKERS[model],
             "model": model,
             "output_audio_codec": _OUTPUT_AUDIO_CODEC,
             "speech_sample_rate": _SPEECH_SAMPLE_RATE,
