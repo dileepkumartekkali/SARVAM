@@ -72,7 +72,7 @@ class AzureFallbackTTSClient:
         text_chunks: AsyncIterator[str],
         *,
         language: str,
-        model: str = "bulbul:v2",  # ignored — Azure has its own voice models, kept for interface parity
+        model: str = "bulbul:v3",  # ignored — Azure has its own voice models, kept for interface parity
         voice: str | None = None,
         pace: float | None = None,
     ) -> AsyncIterator[bytes]:

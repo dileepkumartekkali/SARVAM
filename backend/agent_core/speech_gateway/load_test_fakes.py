@@ -47,7 +47,7 @@ class LoadTestFakeSTT:
 
 
 class LoadTestFakeTTS:
-    async def synthesize(self, text_chunks, *, language, model="bulbul:v2", voice=None, pace=None):
+    async def synthesize(self, text_chunks, *, language, model="bulbul:v3", voice=None, pace=None):
         async for _ in text_chunks:
             await asyncio.sleep(0.005)
             yield b"\x00\x00" * 100

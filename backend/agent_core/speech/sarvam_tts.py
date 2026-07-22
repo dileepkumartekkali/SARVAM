@@ -69,19 +69,16 @@ _LANGUAGE_TO_SARVAM_CODE = {
     "en": "en-IN",
 }
 
-# Real bug hit live, reported as "English is clear, Telugu is not,
-# and now no audio at all": this app assumed model="bulbul:v3" as the
-# default everywhere, with "shubh" as its speaker (bulbul:v3's own
-# documented default). Confirmed DIRECTLY against the live API with this
-# account's real key: every v3-only speaker (shubh, priya, aditya, ...) is
-# rejected as "not compatible with model bulbul:v2" regardless of what
-# "model" value is sent -- this account's real Sarvam API does not honor
-# bulbul:v3 at all, it always evaluates as v2. "anushka" (a real v2
-# speaker) succeeded in that same direct test. The actual default model is
-# now "bulbul:v2" (see synthesize()'s own default, and every call site) --
-# kept model-aware here (matching this file's own _PACE_RANGES pattern)
-# so bulbul:v3 stays a supported, correct path if this account's access
-# ever changes, without being the (currently broken) default.
+# A real, live-confirmed bug briefly lived here: an earlier key on this
+# account had no bulbul:v3 access at all -- every v3-only speaker
+# ("shubh", the default below, included) was rejected as "not compatible
+# with model bulbul:v2," so v2 was temporarily made the default. Switched
+# to a key with real v3 access; back to v3 by default. NOT independently
+# re-verified against a live v3-enabled key from this environment (this
+# repo's own dev key still lacks v3 access) -- confirm live once the real
+# deployed key is updated. Kept model-aware (matching this file's own
+# _PACE_RANGES pattern) so a key without v3 access degrades to a real
+# error rather than a wrong/incompatible speaker being silently sent.
 _DEFAULT_SPEAKERS = {"bulbul:v2": "anushka", "bulbul:v3": "shubh"}
 
 
@@ -148,7 +145,7 @@ class SarvamTTSClient:
         text_chunks: AsyncIterator[str],
         *,
         language: str,
-        model: str = "bulbul:v2",
+        model: str = "bulbul:v3",
         voice: str | None = None,
         pace: float | None = None,
     ) -> AsyncIterator[bytes]:

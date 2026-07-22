@@ -22,12 +22,10 @@
  * `linear16` PCM at a fixed 24000Hz — confirmed live to work (a real
  * synthesize() call returned real audio bytes at this rate) — NOT the
  * 22050Hz this constant used to guess, which was never actually verified
- * against a real payload. Separately: this app was ALSO assuming model
- * "bulbul:v3" everywhere, but this account's real Sarvam API doesn't honor
- * v3 at all (confirmed directly — every v3-only speaker gets rejected as
- * incompatible with bulbul:v2, regardless of the model value sent); the
- * actual default is now "bulbul:v2" (useVoiceSession.js, sarvam_tts.py).
- * `decodeAudioData` below is expected to
+ * against a real payload. Separately: an earlier key on this account had no
+ * bulbul:v3 access at all (confirmed live — every v3-only speaker rejected
+ * as incompatible with bulbul:v2); a key with real v3 access is now in use
+ * (useVoiceSession.js, sarvam_tts.py). `decodeAudioData` below is expected to
  * always fail on raw PCM (it has no container header to parse) and fall
  * through to the PCM16 path every time — that's the normal path now, not a
  * rare fallback.
