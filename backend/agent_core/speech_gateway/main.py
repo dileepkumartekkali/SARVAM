@@ -334,6 +334,13 @@ async def tts_ws(websocket: WebSocket, tts_client_resolver=Depends(get_tts_clien
         errors_total.labels(stage="tts").inc()
         await websocket.send_json({"type": "text_only_fallback", "message": TTS_FAILURE_APOLOGY})
 
+    # Real gap: nothing here ever logged how much audio actually got sent --
+    # a request that "succeeds" (no exception) but Sarvam silently returns
+    # zero chunks for (a valid config that just produces no audio for this
+    # specific text/speaker/language combination) looked IDENTICAL in the
+    # logs to one that worked, forcing guesswork on a live "no audio" report.
+    chunk_count = 0
+    total_bytes = 0
     try:
         with start_span("speech_gateway", "tts.synthesize", language=language, model=model):
             async for audio_bytes in tts_synthesize_with_retry_then_fallback(
@@ -342,7 +349,21 @@ async def tts_ws(websocket: WebSocket, tts_client_resolver=Depends(get_tts_clien
                 if not first_chunk_seen:
                     first_chunk_seen = True
                     tts_ttfb_seconds.observe(time.monotonic() - turn_start)
+                chunk_count += 1
+                total_bytes += len(audio_bytes)
                 await websocket.send_bytes(audio_bytes)
+        if chunk_count == 0:
+            logger.warning(
+                "TTS synthesis produced ZERO audio chunks with no exception raised "
+                "(language=%s, model=%s, voice=%s) -- Sarvam accepted the request but "
+                "silently returned no audio for this text/speaker/language combination.",
+                language, model, voice,
+            )
+        else:
+            logger.info(
+                "TTS synthesis sent %d chunk(s), %d bytes (language=%s, model=%s, voice=%s)",
+                chunk_count, total_bytes, language, model, voice,
+            )
     except (SpeechStreamError, TTSStreamError) as e:
         errors_total.labels(stage="tts").inc()
         await websocket.send_json({"type": "error", "reason": str(e)})
