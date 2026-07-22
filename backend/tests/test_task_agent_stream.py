@@ -9,6 +9,7 @@ from agent_core.agents.task_agent import stream_turn
 from agent_core.llm_adapter import LLMRouter
 from agent_core.llm_adapter.base import CompletionResult, LLMProviderError
 from agent_core.supervisor.state import Mode, SessionState
+from agent_core.tools.rag_tool import TOOL_VERIFIED_MARKER
 
 from ._fakes import FakeProvider, ScriptedProvider
 
@@ -161,6 +162,30 @@ async def test_stream_turn_does_not_force_retrieval_when_company_not_named():
 
     assert called["n"] == 0
     assert events[-1]["tool_call_count"] == 0
+
+
+async def test_stream_turn_never_leaks_marker_through_a_live_text_delta():
+    """Real bug hit live a SECOND time: sanitize_llm_output() was only ever
+    applied to the FINAL accumulated "done" text -- but the frontend
+    renders progressively from live text_delta events as they stream in,
+    well before "done" ever fires. If the model echoes
+    TOOL_VERIFIED_MARKER mid-stream (imitating the pattern from its own
+    prior turn in history), the raw chunk leaked to the user despite the
+    eventual "done" event's own text being clean. Each streamed delta must
+    now be stripped too, not just the final text."""
+    reply_with_marker = f"The CEO is Real Person.\n{TOOL_VERIFIED_MARKER}"
+    provider = ScriptedProvider([reply_with_marker, "OK"])
+    router = LLMRouter([provider])
+
+    events = [e async for e in stream_turn(_session(), router, "who is the ceo")]
+
+    text_deltas = [e["text"] for e in events if e["type"] == "text_delta"]
+    for delta in text_deltas:
+        assert TOOL_VERIFIED_MARKER not in delta
+    assert "".join(text_deltas) == "The CEO is Real Person."
+
+    done = events[-1]
+    assert TOOL_VERIFIED_MARKER not in done["text"]
 
 
 async def test_stream_turn_falls_back_to_run_turn_on_tool_call_prefix():

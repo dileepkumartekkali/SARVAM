@@ -49,3 +49,42 @@ def sanitize_llm_output(text: str) -> str:
     # trailing/leading whitespace it exposes at the very ends of the reply.
     cleaned = re.sub(r"\n{2,}", "\n", cleaned).strip()
     return cleaned
+
+
+def strip_tool_verified_marker(text: str) -> str:
+    """Lighter than sanitize_llm_output() -- only strips the exact marker
+    text, never the full-reply HTML/system-prompt-leak checks above. Safe
+    for a single already-complete piece of text; NOT safe alone for a
+    stream of arbitrarily-split chunks -- see marker_safe_split() below for
+    why a per-chunk-only check was proven insufficient."""
+    return _TOOL_VERIFIED_MARKER_RE.sub("", text)
+
+
+_MARKER_LEN = len(TOOL_VERIFIED_MARKER)
+
+
+def marker_safe_split(buffered: str) -> tuple[str, str]:
+    """Real gap caught by this fix's OWN regression test, twice over: (1) a
+    per-chunk-only strip isn't enough -- the chunker can split the marker
+    text itself across two separate deltas, so neither individual chunk
+    contains the full string and checking each one in isolation misses it
+    entirely. (2) The first attempt at THIS function searched for the
+    marker only within the "safe" portion after splitting, not the whole
+    buffer -- if the marker straddled the split point, it could be cut
+    exactly in half by the split itself (its opening stranded in "safe"
+    with no closing bracket, its closing stranded in "tail" with no
+    opening bracket), so NEITHER half would ever match the full pattern
+    and it would leak forever, never becoming whole again.
+
+    Correct order: strip the FULL marker from the ENTIRE buffered text
+    FIRST (a complete occurrence, wherever it started, is always found
+    this way), and only THEN decide the safe/tail split on what's left.
+    Holds back the last (marker_len - 1) characters of the CLEANED text --
+    a partial marker still forming can never be longer than that, so it's
+    always fully contained in what's held back, never in what's released.
+    Returns (safe_to_yield, new_tail_to_keep_buffering)."""
+    cleaned = _TOOL_VERIFIED_MARKER_RE.sub("", buffered)
+    if len(cleaned) <= _MARKER_LEN - 1:
+        return "", cleaned
+    split_at = len(cleaned) - (_MARKER_LEN - 1)
+    return cleaned[:split_at], cleaned[split_at:]

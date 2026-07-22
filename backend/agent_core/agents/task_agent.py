@@ -22,7 +22,7 @@ from typing import Awaitable, Callable, AsyncIterator, Sequence
 from ..llm_adapter.base import LLMProviderError, LLMRouter, Message, ToolCall, ToolDefinition
 from ..observability.tracing import start_span
 from ..security.confirmation import ConfirmationGate, PendingConfirmation
-from ..security.output_validation import sanitize_llm_output
+from ..security.output_validation import marker_safe_split, sanitize_llm_output, strip_tool_verified_marker
 from ..speech.chunker import chunk_stream
 from ..supervisor.state import Mode, SessionState
 from .cancellation import CancellationToken, TurnCancelled
@@ -484,11 +484,29 @@ async def stream_turn(
     known_tool_names = frozenset((tools or {}).keys())
     with start_span("task_agent", "task_agent.stream_turn", mode=session.mode.value, prompt_version=version_id):
         accumulated: list[str] = []
+        # Real bug hit live, twice: sanitize_llm_output() only ever ran on
+        # the FINAL accumulated "done" text below -- but the frontend
+        # renders progressively from live text_delta events as they stream
+        # in, well before "done" ever fires. A per-chunk-only strip was
+        # ALSO proven insufficient (this fix's own regression test caught
+        # it): the chunker can split the marker text itself across two
+        # separate deltas, so neither chunk alone contains the full string.
+        # marker_safe_split holds back a small tail buffer across chunk
+        # boundaries instead -- see its own docstring for the full reasoning.
+        marker_tail = ""
         try:
             raw_stream = router.stream_with_fallback(messages, system=system_prompt)
             async for chunk in chunk_stream(_sniff_and_forward(raw_stream, known_tool_names)):
                 accumulated.append(chunk)
-                yield {"type": "text_delta", "text": chunk}
+                marker_tail += chunk
+                safe_text, marker_tail = marker_safe_split(marker_tail)
+                if safe_text:
+                    yield {"type": "text_delta", "text": safe_text}
+            # Stream ended normally -- nothing more can arrive to complete a
+            # marker spanning the tail, so whatever's left is safe to flush.
+            final_flush = strip_tool_verified_marker(marker_tail)
+            if final_flush:
+                yield {"type": "text_delta", "text": final_flush}
         except _ToolCallDetected:
             result = await run_turn(
                 session,
