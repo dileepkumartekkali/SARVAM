@@ -23,10 +23,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import os
 from typing import AsyncIterator, Callable
 
 import websockets
+
+logger = logging.getLogger("agent_core.speech")
 import websockets.exceptions
 
 # How long to wait, after the last audio chunk for a flushed text message,
@@ -179,6 +182,16 @@ class SarvamTTSClient:
                             break  # idle after audio — treat as this chunk's end (see module docstring)
                         event = json.loads(raw)
                         event_type = event.get("type")
+                        # Real gap: a live "zero audio chunks, no exception"
+                        # report couldn't be explained by any existing log --
+                        # nothing recorded WHAT Sarvam actually sent back when
+                        # it wasn't "audio". Logs every event TYPE (never the
+                        # base64 audio payload itself -- that's the one case
+                        # excluded, to avoid flooding logs with audio data).
+                        if event_type == "audio":
+                            logger.debug("Sarvam TTS event: type=audio (%d b64 chars)", len(event.get("data", {}).get("audio", "")))
+                        else:
+                            logger.info("Sarvam TTS event: type=%s data=%s", event_type, event.get("data"))
                         if event_type == "audio":
                             received_any_audio = True
                             yield base64.b64decode(event["data"]["audio"])
