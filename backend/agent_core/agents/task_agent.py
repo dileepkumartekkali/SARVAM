@@ -432,14 +432,30 @@ async def stream_turn(
             return
 
         draft = "".join(accumulated)
-        self_check_ok, self_check_reason = await _self_check(
-            draft,
-            session.mode,
-            router,
-            response_language=session.response_language,
-            is_code_mixed=session.is_code_mixed,
-            expected_script=expected_script,
-        )
+        try:
+            self_check_ok, self_check_reason = await _self_check(
+                draft,
+                session.mode,
+                router,
+                response_language=session.response_language,
+                is_code_mixed=session.is_code_mixed,
+                expected_script=expected_script,
+            )
+        except LLMProviderError:
+            # Real bug hit live: this call had NO exception handling at all,
+            # unlike the main generation call right above it. If every
+            # configured provider fails for THIS specific call (its own
+            # fallback chain exhausted -- plausible right after the main
+            # call just used the same rate-limited provider), the whole
+            # generator crashed uncaught, no "done" event ever sent. The
+            # real answer was already fully generated and streamed by this
+            # point (already spoken/shown) -- self-check is a QA step on
+            # already-good output, not something that should be able to
+            # take the whole turn down. Treat it as inconclusive, not failed
+            # (self_check_ok stays True — a review that never ran isn't the
+            # same claim as "ran and found a violation").
+            logger.info("turn_trace", extra={"prompt_version": version_id, "self_check_provider_error": True})
+            self_check_ok, self_check_reason = True, "self-check itself failed (provider error) — not evaluated"
         # No correction-retry here, deliberately — see the module-level note
         # above. A failure is logged so it's visible in traces, not silently
         # dropped, but the already-streamed text stands as the shown/spoken
@@ -659,7 +675,21 @@ async def run_turn(
                 )
                 return await (cancellation_token.run(coro) if cancellation_token is not None else coro)
 
-            self_check_ok, self_check_reason = await check(draft)
+            # Real bug hit live: this call had no exception handling at all
+            # -- unlike the correction-retry's OWN self-check call a few
+            # lines below, which IS wrapped. If every configured provider
+            # fails for this specific call, it used to propagate uncaught
+            # out of run_turn entirely -- which, reached via stream_turn's
+            # tool-call fallback, meant the whole SSE stream died with no
+            # "done" event ever sent: the answer (or tool result) was
+            # already computed, but the turn never completed from the
+            # caller's perspective. Same "inconclusive, not failed" handling
+            # as stream_turn's own guard on its self-check call.
+            try:
+                self_check_ok, self_check_reason = await check(draft)
+            except LLMProviderError:
+                logger.info("turn_trace", extra={"prompt_version": version_id, "self_check_provider_error": True})
+                self_check_ok, self_check_reason = True, "self-check itself failed (provider error) — not evaluated"
 
             # Detected violations previously had zero effect on the shipped
             # answer — self_check_ok would just come back False while the

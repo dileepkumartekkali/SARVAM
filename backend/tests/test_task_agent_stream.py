@@ -211,6 +211,41 @@ async def test_stream_turn_self_check_failure_is_logged_not_corrected():
     assert done["text"] == long_reply
 
 
+class _SelfCheckReviewerFails:
+    """Main generation succeeds with a short, compliant reply (so the
+    deterministic checks in _self_check don't short-circuit before ever
+    reaching the LLM reviewer call) -- but that reviewer call itself fails
+    completely, on every configured provider."""
+
+    name = "self-check-fails"
+
+    async def stream(self, messages, *, system=None, max_tokens=None, temperature=None):
+        yield "A short, compliant reply."
+
+    async def complete(self, messages, *, system=None, max_tokens=None, temperature=None):
+        raise LLMProviderError("boom", retriable=False)
+
+
+async def test_stream_turn_never_crashes_when_self_checks_own_call_fails():
+    """Real bug hit live: _self_check's reviewer LLM call had NO exception
+    handling at all -- if every configured provider failed for that
+    specific call (its own fallback chain exhausted), it propagated
+    uncaught out of the whole stream_turn generator, which meant the SSE
+    stream died with no "done" event ever sent -- even though the real
+    answer was already fully generated and streamed. The turn must still
+    complete; self-check failing to even run is not the same as it running
+    and finding a violation."""
+    router = LLMRouter([_SelfCheckReviewerFails()])
+
+    events = [e async for e in stream_turn(_session(), router, "hi")]
+
+    done = events[-1]
+    assert done["type"] == "done"
+    assert done["text"] == "A short, compliant reply."
+    assert done["self_check_ok"] is True
+    assert "not evaluated" in done["self_check_reason"]
+
+
 async def test_stream_turn_provider_failure_never_yields_a_text_delta():
     """The apology on total provider failure is not a real answer -- it must
     never be spoken aloud (voice mode's TTS socket is fed from text_delta

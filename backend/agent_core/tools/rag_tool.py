@@ -69,11 +69,25 @@ async def search_company_knowledge(query: str) -> str:
 def build_rag_tool_spec() -> ToolSpec:
     return ToolSpec(
         name="search_company_knowledge",
+        # Real bug hit live: the old wording ("not for general knowledge the
+        # model already has") backfired specifically for the facts this
+        # tool exists to answer -- a private company's CEO/leadership names,
+        # specific numbers, etc. are things no general-purpose model was
+        # ever trained on, but models confidently hallucinate a plausible-
+        # sounding answer anyway and judge it as "knowledge I already have,"
+        # skipping the tool entirely. Confirmed live: "who is the CEO of
+        # mTouch Labs" (plain English, no language directive even in play)
+        # got a different wrong name each time with the old wording, tool
+        # never called. Rewritten to name the specific failure mode instead
+        # of leaving the judgment call to the model.
         description=(
-            "Searches mTouch Labs' own website content (services, leadership, "
-            "vision, awards, etc.) for facts relevant to the user's question. "
-            "Use this for anything specific to mTouch Labs as a company -- "
-            "not for general knowledge the model already has."
+            "Searches mTouch Labs' own real website content (services, leadership/CEO, "
+            "vision, awards, case studies, etc.) for facts about the company. ALWAYS call "
+            "this for ANY question asking for a specific mTouch Labs fact — who leads/founded "
+            "the company, what services/products exist, awards won, case study details, and "
+            "similar. These are private company details a general-purpose model was never "
+            "trained on; a name or fact that seems familiar is still a guess, not real "
+            "knowledge — never answer from memory here, even if confident."
         ),
         parameters={"query": {"type": "string", "description": "what to search for, in the user's own words"}},
         required=["query"],

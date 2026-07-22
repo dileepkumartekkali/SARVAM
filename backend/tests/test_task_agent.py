@@ -344,6 +344,40 @@ def _fail_on_third_call(original):
     return wrapper
 
 
+def _fail_on_second_call(original):
+    calls = {"n": 0}
+
+    async def wrapper(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise LLMProviderError("boom", retriable=False, provider="scripted")
+        return await original(*args, **kwargs)
+
+    return wrapper
+
+
+async def test_self_checks_own_call_failing_does_not_crash_run_turn():
+    """Real bug hit live: the FIRST self-check call had no exception
+    handling at all -- unlike the correction-retry's own self-check call
+    (test_self_check_correction_failure_keeps_original_draft, above) which
+    IS wrapped. If every configured provider fails for THIS specific call,
+    it used to propagate uncaught out of run_turn entirely -- reached via
+    stream_turn's tool-call fallback, that meant the whole SSE stream died
+    with no "done" event ever sent, even though the real answer was
+    already fully generated. Call #1 is the main generation, call #2 is
+    self-check's own reviewer call -- fail exactly that one."""
+    compliant_draft = "A short, compliant reply."
+    provider = ScriptedProvider([compliant_draft])
+    provider.complete = _fail_on_second_call(provider.complete)
+    router = LLMRouter([provider])
+
+    result = await run_turn(_session(Mode.TEXT_TO_TEXT), router, "hi")
+
+    assert result.text == compliant_draft
+    assert result.self_check_ok is True
+    assert "not evaluated" in result.self_check_reason
+
+
 async def test_llm_provider_error_returns_apology_not_a_crash():
     """Every configured provider failing (e.g. a malformed spontaneous tool
     call the API itself rejects) must degrade to a fixed apology, never an
