@@ -74,6 +74,43 @@ async def test_tool_exception_reported_as_tool_result_not_crash():
     assert "failed" in result.text
 
 
+async def test_run_turn_forces_retrieval_when_message_names_the_company():
+    """Same forced-retrieval mechanism as stream_turn's own test -- parity
+    for the plain /chat endpoint's path."""
+    provider = ScriptedProvider(["The CEO is Real Person.", "OK"])
+    router = LLMRouter([provider])
+
+    async def fake_search(query: str) -> str:
+        return "REAL FACT: the CEO is Real Person."
+
+    result = await run_turn(
+        _session(), router, "who is the mtouch labs ceo",
+        tools={"search_company_knowledge": fake_search},
+    )
+
+    assert result.tool_call_count == 1
+    assert "REAL FACT" in str(provider.messages_by_call[0])
+
+
+async def test_legacy_bare_tool_name_call_without_wrapper_is_recognized():
+    """Real bug hit live: the model called a tool by writing its name
+    directly -- "search_company_knowledge: {...}" -- with no "TOOL_CALL:"
+    wrapper at all. _parse_tool_call used to only recognize the wrapped
+    form, so this leaked as the final answer text and the tool never ran."""
+    provider = ScriptedProvider(
+        ['search_company_knowledge: {"query": "mTouch Labs awards won"}', "mTouch Labs won the NASSCOM award.", "OK"]
+    )
+    router = LLMRouter([provider])
+
+    result = await run_turn(
+        _session(), router, "what awards has the company won",
+        tools={"search_company_knowledge": noop_tool},
+    )
+
+    assert result.tool_call_count == 1
+    assert result.text == "mTouch Labs won the NASSCOM award."
+
+
 async def test_unavailable_tool_reported_as_tool_result_not_crash():
     provider = ScriptedProvider(
         ['TOOL_CALL: {"name": "does_not_exist", "args": {}}', "Sorry, I couldn't find that."]

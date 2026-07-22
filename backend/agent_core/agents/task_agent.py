@@ -189,9 +189,52 @@ def _turn_directive(session: SessionState, user_message: str) -> str:
     return " ".join(d for d in (_language_directive(session, user_message), _voice_brevity_directive(session)) if d)
 
 
-def _parse_tool_call(raw: str) -> ToolCall | None:
+# Real bug hit live, repeatedly, after every prompt-level fix already tried
+# here (tool description rewrite, history-verification marker): whether the
+# model chooses to call search_company_knowledge at ALL is model judgment,
+# not a guarantee -- live re-testing kept showing it skipped for company-
+# name queries and hallucinated a confident wrong answer instead. For the
+# one clear, high-precision signal available -- the user's own message
+# explicitly naming "mtouch" -- retrieval is now forced in code, never left
+# to the model's discretion, same "enforced in code, not a prompt
+# instruction a model could ignore" philosophy as security/confirmation.py's
+# gate. False-positive risk is effectively zero (nobody says "mtouch"
+# unless asking about this specific company); the cost is one extra
+# embedding+DB lookup only for messages that actually name it.
+_FORCED_RETRIEVAL_TOOL_NAME = "search_company_knowledge"
+_FORCED_RETRIEVAL_KEYWORD = "mtouch"
+
+
+async def _forced_company_context(user_message: str, tools: dict[str, ToolFn] | None) -> str | None:
+    if not tools or _FORCED_RETRIEVAL_TOOL_NAME not in tools:
+        return None
+    if _FORCED_RETRIEVAL_KEYWORD not in user_message.lower().replace(" ", ""):
+        return None
+    return await tools[_FORCED_RETRIEVAL_TOOL_NAME](query=user_message)
+
+
+def _with_forced_context(user_message: str, forced_context: str | None) -> str:
+    if not forced_context:
+        return user_message
+    return (
+        "[The following was already retrieved from mTouch Labs' real website content — "
+        f"use it directly to answer; do not guess or use any other name/fact]\n{forced_context}\n\n{user_message}"
+    )
+
+
+def _parse_tool_call(raw: str, known_tool_names: frozenset[str] = frozenset()) -> ToolCall | None:
     """Legacy text-convention fallback — only consulted when the native path
-    (`complete_with_tools_and_fallback`) returned no structured tool calls."""
+    (`complete_with_tools_and_fallback`) returned no structured tool calls.
+
+    Real bug hit live: this only ever recognized the documented
+    `TOOL_CALL: {"name": ..., "args": ...}` wrapper, but the model was
+    observed calling a tool by writing its name directly instead --
+    `search_company_knowledge: {"query": "..."}`, no wrapper at all. That's
+    a genuine tool-call ATTEMPT, not the model declining to use the tool --
+    but since this parser didn't recognize the format, it silently became
+    the final-answer text (leaked to the user) instead of a dispatched
+    call. Now also matches a bare `<tool_name>: {...}` line for any
+    registered tool name."""
     for line in raw.splitlines():
         line = line.strip()
         if line.startswith("TOOL_CALL:"):
@@ -200,6 +243,14 @@ def _parse_tool_call(raw: str) -> ToolCall | None:
                 return ToolCall(id="legacy-text-call", name=payload["name"], args=payload.get("args", {}))
             except (json.JSONDecodeError, KeyError, TypeError):
                 return None
+        for name in known_tool_names:
+            prefix = f"{name}:"
+            if line.startswith(prefix):
+                try:
+                    args = json.loads(line[len(prefix) :].strip())
+                except json.JSONDecodeError:
+                    continue
+                return ToolCall(id="legacy-text-call", name=name, args=args if isinstance(args, dict) else {})
     return None
 
 
@@ -318,12 +369,29 @@ class _ToolCallDetected(Exception):
     run_turn() instead, unmodified, for real native tool-calling."""
 
 
-async def _sniff_and_forward(raw_stream: AsyncIterator[str]) -> AsyncIterator[str]:
+def _looks_like_tool_call_attempt(text: str, known_tool_names: frozenset[str]) -> bool:
+    """True for the documented `TOOL_CALL: {...}` marker OR a bare
+    `<tool_name>: {...}` line for any registered tool -- real bug hit live:
+    the model was observed calling a tool by writing its name directly,
+    skipping the "TOOL_CALL:" wrapper entirely (e.g.
+    `search_company_knowledge: {"query": "..."}`). That's a genuine tool-
+    call ATTEMPT the old check (only the literal "TOOL_CALL:" string) was
+    blind to, so it leaked straight to the UI/TTS as if it were a real
+    answer instead of triggering the run_turn() fallback."""
+    if "TOOL_CALL:" in text:
+        return True
+    return any(f"{name}:" in text for name in known_tool_names)
+
+
+async def _sniff_and_forward(
+    raw_stream: AsyncIterator[str], known_tool_names: frozenset[str] = frozenset()
+) -> AsyncIterator[str]:
     """Buffers the first ~200 chars of a raw token stream before forwarding
-    anything, checking whether a `TOOL_CALL: {...}` marker appears ANYWHERE
-    in that window -- including after a newline, e.g. an explanation line
-    followed by the marker on its own line (see _TOOL_CALL_SNIFF_CHARS's
-    comment for why a newline can't be treated as an early "safe" signal)."""
+    anything, checking whether a tool-call attempt (see
+    `_looks_like_tool_call_attempt`) appears ANYWHERE in that window --
+    including after a newline, e.g. an explanation line followed by the
+    marker on its own line (see _TOOL_CALL_SNIFF_CHARS's comment for why a
+    newline can't be treated as an early "safe" signal)."""
     buffered = ""
     sniffed = False
     async for delta in raw_stream:
@@ -333,12 +401,12 @@ async def _sniff_and_forward(raw_stream: AsyncIterator[str]) -> AsyncIterator[st
         buffered += delta
         if len(buffered) >= _TOOL_CALL_SNIFF_CHARS:
             sniffed = True
-            if "TOOL_CALL:" in buffered:
+            if _looks_like_tool_call_attempt(buffered, known_tool_names):
                 raise _ToolCallDetected()
             yield buffered
     if not sniffed:
         # Stream ended before hitting the sniff threshold (a short reply).
-        if "TOOL_CALL:" in buffered:
+        if _looks_like_tool_call_attempt(buffered, known_tool_names):
             raise _ToolCallDetected()
         if buffered:
             yield buffered
@@ -373,14 +441,17 @@ async def stream_turn(
     system_prompt, version_id = _build_system_prompt(session, version=prompt_version, tool_manifest=tool_manifest)
     directive = _turn_directive(session, user_message)
     expected_script = _expected_script(session, user_message)
-    initial_message = f"{directive}\n\n{user_message}" if directive else user_message
+    forced_context = await _forced_company_context(user_message, tools)
+    augmented_user_message = _with_forced_context(user_message, forced_context)
+    initial_message = f"{directive}\n\n{augmented_user_message}" if directive else augmented_user_message
     messages: list[Message] = [*(history or []), {"role": "user", "content": initial_message}]
 
+    known_tool_names = frozenset((tools or {}).keys())
     with start_span("task_agent", "task_agent.stream_turn", mode=session.mode.value, prompt_version=version_id):
         accumulated: list[str] = []
         try:
             raw_stream = router.stream_with_fallback(messages, system=system_prompt)
-            async for chunk in chunk_stream(_sniff_and_forward(raw_stream)):
+            async for chunk in chunk_stream(_sniff_and_forward(raw_stream, known_tool_names)):
                 accumulated.append(chunk)
                 yield {"type": "text_delta", "text": chunk}
         except _ToolCallDetected:
@@ -460,11 +531,16 @@ async def stream_turn(
         # above. A failure is logged so it's visible in traces, not silently
         # dropped, but the already-streamed text stands as the shown/spoken
         # output either way.
+        # Counts as 1, not 0, when forced_context was injected -- this WAS a
+        # real tool-backed answer (just dispatched in code, not by the
+        # model's own choice), and callers (api/main.py, graph.py) key the
+        # TOOL_VERIFIED_MARKER history tag off this exact field.
+        effective_tool_call_count = 1 if forced_context else 0
         logger.info(
             "turn_trace",
             extra={
                 "prompt_version": version_id,
-                "tool_call_count": 0,
+                "tool_call_count": effective_tool_call_count,
                 "self_check_ok": self_check_ok,
                 "self_check_reason": self_check_reason,
                 "streamed": True,
@@ -474,7 +550,7 @@ async def stream_turn(
             "type": "done",
             "text": sanitize_llm_output(draft),
             "prompt_version": version_id,
-            "tool_call_count": 0,
+            "tool_call_count": effective_tool_call_count,
             "self_check_ok": self_check_ok,
             "self_check_reason": self_check_reason,
             "pending_confirmation": None,
@@ -530,9 +606,14 @@ async def run_turn(
     directive = _turn_directive(session, user_message)
     expected_script = _expected_script(session, user_message)
 
-    initial_message = f"{directive}\n\n{user_message}" if directive else user_message
+    forced_context = await _forced_company_context(user_message, tools)
+    augmented_user_message = _with_forced_context(user_message, forced_context)
+    initial_message = f"{directive}\n\n{augmented_user_message}" if directive else augmented_user_message
     messages: list[Message] = [*(history or []), {"role": "user", "content": initial_message}]
-    tool_call_count = 0
+    # Forced retrieval counts as a real tool-backed answer for the
+    # TOOL_VERIFIED_MARKER history tag (graph.py), even though it was
+    # dispatched in code rather than via the model's own tool_calls.
+    tool_call_count = 1 if forced_context else 0
     draft = ""
 
     with start_span("task_agent", "task_agent.run_turn", mode=session.mode.value, prompt_version=version_id):
@@ -572,7 +653,7 @@ async def run_turn(
                 if not calls:
                     # No native tool calls came back — fall back to the
                     # legacy text convention before treating this as a final answer.
-                    legacy_call = _parse_tool_call(result.text)
+                    legacy_call = _parse_tool_call(result.text, frozenset(tools.keys()))
                     if legacy_call is not None:
                         calls = [legacy_call]
 
