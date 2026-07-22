@@ -42,6 +42,25 @@ _DEFAULT_WS_URL = "wss://api.sarvam.ai/text-to-speech/ws"
 
 _PACE_RANGES = {"bulbul:v2": (0.3, 3.0), "bulbul:v3": (0.5, 2.0)}
 
+# Real bug hit live: reported as "TTS speaking not clear" -- Sarvam's own
+# docs (docs.sarvam.ai/api-reference/text-to-speech/stream, confirmed live)
+# say `output_audio_codec` defaults to MP3, not raw PCM, when this config
+# field is omitted -- which it always was here. Each streamed "audio" event
+# is a FRAGMENT of a continuous MP3 stream, not a self-contained file; MP3
+# decodes chunk-by-chunk (this app's whole playback model, ttsPlayback.js)
+# have frame-to-frame bit-reservoir dependencies, so decoding arbitrary
+# fragments in isolation produces exactly the glitchy/unclear audio
+# reported. Requesting uncompressed linear16 PCM instead means every chunk
+# decodes cleanly and independently, matching how it's actually played.
+_OUTPUT_AUDIO_CODEC = "linear16"
+# bulbul:v3's own documented default sample rate (24000 Hz) -- NOT the
+# 22050 Hz bulbul:v2 defaults to, which frontend/src/api/ttsPlayback.js's
+# fallback PCM decoder was hardcoded to (a guess that was never actually
+# verified against Sarvam's real API, per that file's own docstring).
+# Requested explicitly so both sides agree on a known rate instead of each
+# independently guessing.
+_SPEECH_SAMPLE_RATE = 24000
+
 # Sarvam's TTS language codes are "<lang>-IN", not the bare 2-letter codes
 # language_agent uses elsewhere in this codebase.
 _LANGUAGE_TO_SARVAM_CODE = {
@@ -96,6 +115,8 @@ class SarvamTTSClient:
             "target_language_code": _LANGUAGE_TO_SARVAM_CODE.get(language, language),
             "speaker": voice or _DEFAULT_SPEAKER,
             "model": model,
+            "output_audio_codec": _OUTPUT_AUDIO_CODEC,
+            "speech_sample_rate": _SPEECH_SAMPLE_RATE,
         }
         if pace is not None:
             data["pace"] = pace

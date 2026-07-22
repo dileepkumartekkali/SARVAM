@@ -68,6 +68,28 @@ async def test_config_message_uses_real_sarvam_field_names(monkeypatch):
     assert "language" not in config_message  # the old, wrong, flat field
 
 
+async def test_config_requests_raw_pcm_not_the_mp3_default(monkeypatch):
+    """Real bug hit live: reported as "TTS speaking not clear" -- Sarvam
+    defaults output_audio_codec to MP3 when omitted (confirmed against
+    their real docs), and this config never set it. Each streamed chunk is
+    a fragment of a continuous MP3 stream, not a self-contained file --
+    decoding arbitrary fragments in isolation (this app's whole
+    chunk-by-chunk playback model) produces glitchy audio. Requesting
+    linear16 (raw PCM) instead means every chunk decodes cleanly on its
+    own, matching how it's actually played."""
+    monkeypatch.setenv("SARVAM_API_KEY", "test-key")
+    ws = FakeWSConnection(incoming=[_FINAL_EVENT])
+    client = SarvamTTSClient(connect=fake_connect_returning(ws))
+
+    _ = [a async for a in client.synthesize(_texts("hi"), language="hi", model="bulbul:v3")]
+
+    config_message = json.loads(ws.sent[0])
+    assert config_message["data"]["output_audio_codec"] == "linear16"
+    # bulbul:v3's own documented default -- explicit, not left to guesswork
+    # on either side of the connection.
+    assert config_message["data"]["speech_sample_rate"] == 24000
+
+
 async def test_error_event_raises_tts_stream_error(monkeypatch):
     monkeypatch.setenv("SARVAM_API_KEY", "test-key")
     error_event = json.dumps({"type": "error", "data": {"message": "bad request", "code": 422}})

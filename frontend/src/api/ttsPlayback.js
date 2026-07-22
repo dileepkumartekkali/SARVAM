@@ -11,16 +11,22 @@
  * are drained one at a time, each waiting for the previous chunk's
  * `onended`.
  *
- * Sarvam's streaming TTS defaults to WAV-encoded output, so each chunk is
- * decoded with the standard Web Audio decoder; if a chunk ever arrives as
- * headerless raw PCM instead, this falls back to treating it as PCM16LE mono
- * at Sarvam's documented default TTS sample rate (22050Hz).
- *
- * NOT verified against a real Sarvam TTS audio payload — only the transport
- * framing (base64-over-JSON) was confirmed live this session, never the
- * actual audio bytes. Confirm with one real call before depending on this.
+ * Real bug hit live, reported as "TTS speaking not clear": Sarvam's own
+ * docs (confirmed against the real API, not assumed) say `output_audio_codec`
+ * defaults to MP3 when the backend's config omits it — which it always did.
+ * Each streamed chunk is a FRAGMENT of a continuous MP3 stream, not a
+ * self-contained file; MP3's frame-to-frame bit-reservoir dependencies mean
+ * decoding arbitrary fragments in isolation (exactly this queue's
+ * chunk-by-chunk model) produced glitchy, unclear audio. The backend
+ * (agent_core/speech/sarvam_tts.py) now explicitly requests uncompressed
+ * `linear16` PCM at a fixed 24000Hz (bulbul:v3's own documented default —
+ * NOT the 22050Hz this constant used to guess, which was never actually
+ * verified against a real payload). `decodeAudioData` below is expected to
+ * always fail on raw PCM (it has no container header to parse) and fall
+ * through to the PCM16 path every time — that's the normal path now, not a
+ * rare fallback.
  */
-const FALLBACK_SAMPLE_RATE = 22050;
+const FALLBACK_SAMPLE_RATE = 24000;
 
 export class TTSPlayer {
   constructor() {
