@@ -196,7 +196,10 @@ def _voice_brevity_directive(session: SessionState) -> str:
         "easy to speak aloud naturally. Answer directly — never restate or repeat "
         "the question back before answering it. If multiple questions were asked, "
         "answer each in turn without a header, and keep the SAME language and "
-        "code-mixing style consistent across the entire reply, not just the start.]"
+        "code-mixing style consistent across the entire reply, not just the start. "
+        "Never repeat the same phrase, sentence, or fact more than once — if you "
+        "notice yourself about to repeat something already said, stop the answer "
+        "there instead.]"
     )
 
 
@@ -219,6 +222,20 @@ def _turn_directive(session: SessionState, user_message: str) -> str:
 _FORCED_RETRIEVAL_TOOL_NAME = "search_company_knowledge"
 _FORCED_RETRIEVAL_KEYWORD = "mtouch"
 
+# Real bug hit live, severe: a broad "tell me services in detail" query
+# pulled 24,526 characters (~6,131 tokens) of raw retrieved content -- for
+# a voice-mode turn whose OWN brevity rule caps the answer at ~90 words.
+# Confirmed directly: that much raw context caused BOTH the language
+# directive to be ignored (answered in plain English despite Telugu being
+# set) AND, worse, a catastrophic repetition loop -- the same few phrases
+# repeated hundreds of times, which would have been spoken in full by TTS.
+# search_company_knowledge's own top_k=8 stays as-is for the model's own
+# voluntary tool calls (a focused query it chose to ask); this caps only
+# the FORCED-retrieval path, which can't know in advance how broad a
+# query is. ~3000 chars is roughly 2 full chunks -- comfortably more
+# factual grounding than a 90-word spoken answer could ever use.
+_FORCED_CONTEXT_MAX_CHARS = 3000
+
 
 async def _forced_company_context(user_message: str, tools: dict[str, ToolFn] | None) -> str | None:
     if not tools or _FORCED_RETRIEVAL_TOOL_NAME not in tools:
@@ -226,7 +243,7 @@ async def _forced_company_context(user_message: str, tools: dict[str, ToolFn] | 
     if _FORCED_RETRIEVAL_KEYWORD not in user_message.lower().replace(" ", ""):
         return None
     try:
-        return await tools[_FORCED_RETRIEVAL_TOOL_NAME](query=user_message)
+        context = await tools[_FORCED_RETRIEVAL_TOOL_NAME](query=user_message)
     except Exception:  # noqa: BLE001 -- this runs BEFORE any LLM call in
         # both run_turn and stream_turn; search_company_knowledge already
         # catches its own known failure modes and returns an error string
@@ -237,6 +254,9 @@ async def _forced_company_context(user_message: str, tools: dict[str, ToolFn] | 
         # crashing the entire turn before a single token was generated.
         logger.exception("forced_company_context failed unexpectedly")
         return None
+    if context and len(context) > _FORCED_CONTEXT_MAX_CHARS:
+        context = context[:_FORCED_CONTEXT_MAX_CHARS] + "\n[...additional details omitted for brevity]"
+    return context
 
 
 def _with_forced_context(directive_and_message: str, forced_context: str | None) -> str:

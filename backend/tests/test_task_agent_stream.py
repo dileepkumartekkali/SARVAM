@@ -86,6 +86,32 @@ async def test_stream_turn_forces_retrieval_when_message_names_the_company():
     assert "REAL FACT" in str(provider.messages_by_call[0])
 
 
+async def test_stream_turn_caps_forced_context_length():
+    """Real bug hit live, severe: a broad "tell me services in detail" query
+    pulled 24,526 characters of raw retrieved content for a voice-mode turn
+    capped at ~90 words -- confirmed to cause BOTH the language directive
+    being ignored (answered in English despite Telugu being set) and a
+    catastrophic repetition loop hundreds of phrases long, which would have
+    been spoken in full by TTS. Forced context must be capped regardless of
+    how much the tool itself returns."""
+    provider = ScriptedProvider(["A normal, short answer.", "OK"])
+    router = LLMRouter([provider])
+
+    async def fake_search(query: str) -> str:
+        return "X" * 50_000  # simulates the real 24k+ character case
+
+    events = [
+        e async for e in stream_turn(
+            _session(), router, "who is the mtouch labs ceo",
+            tools={"search_company_knowledge": fake_search},
+        )
+    ]
+
+    assert events  # sanity
+    first_call_content = provider.messages_by_call[0][0]["content"]
+    assert len(first_call_content) < 4000  # capped, not the full 50k
+
+
 async def test_stream_turn_survives_forced_retrieval_raising_unexpectedly():
     """Defense in depth: forced retrieval runs BEFORE any LLM call in
     stream_turn. Even though search_company_knowledge already catches its
