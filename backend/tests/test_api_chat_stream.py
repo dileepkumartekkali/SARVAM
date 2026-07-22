@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 import agent_core.api.main as main_module
 from agent_core.api.main import app
 from agent_core.llm_adapter import LLMRouter
+from agent_core.tools.rag_tool import TOOL_VERIFIED_MARKER
 
 from ._fakes import ScriptedProvider
 
@@ -123,3 +124,35 @@ def test_chat_stream_history_is_isolated_per_user_not_just_thread_id(monkeypatch
     second_call_messages = provider.messages_by_call[2]
     combined = " ".join(str(m["content"]) for m in second_call_messages)
     assert "Alice" not in combined
+
+
+def test_chat_stream_history_marks_tool_verified_turns_only(monkeypatch):
+    """Real bug hit live: a wrong answer from a turn that skipped a tool got
+    repeated verbatim on a later question in the same conversation --
+    history had no way to tell "checked" from "guessed." A tool-using
+    turn's stored history entry must carry TOOL_VERIFIED_MARKER; a plain
+    turn's must not."""
+    monkeypatch.setenv("JWT_SIGNING_SECRET", "test-secret")
+    provider = ScriptedProvider(
+        [
+            'TOOL_CALL: {"name": "get_current_datetime", "args": {}}',  # sniffed, discarded
+            'TOOL_CALL: {"name": "get_current_datetime", "args": {}}',  # run_turn's own dispatch
+            "It is currently daytime.",  # run_turn's final answer
+            "OK",  # self-check
+            "Just a plain reply, no tool needed.",  # second turn, no tool call
+            "OK",
+        ]
+    )
+    monkeypatch.setattr(main_module, "_router", LLMRouter([provider]))
+    client = TestClient(app)
+
+    tool_body = {**_REQUEST_BODY, "thread_id": "marker-test-thread", "message": "what time is it"}
+    client.post("/chat/stream", json=tool_body, headers=_auth_header(subject="marker-user"))
+
+    plain_body = {**_REQUEST_BODY, "thread_id": "marker-test-thread", "message": "thanks"}
+    client.post("/chat/stream", json=plain_body, headers=_auth_header(subject="marker-user"))
+
+    history = main_module._stream_history[("marker-user", "marker-test-thread")]
+    assistant_entries = [m["content"] for m in history if m["role"] == "assistant"]
+    assert TOOL_VERIFIED_MARKER in assistant_entries[0]  # the tool-using turn
+    assert TOOL_VERIFIED_MARKER not in assistant_entries[1]  # the plain turn

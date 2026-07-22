@@ -31,7 +31,7 @@ from ..security.confirmation import ConfirmationGate
 from ..supervisor.graph import build_text_graph
 from ..supervisor.state import Mode, SessionState
 from ..tools import build_default_registry
-from ..tools.rag_tool import build_rag_tool_spec, is_available as rag_is_available
+from ..tools.rag_tool import TOOL_VERIFIED_MARKER, build_rag_tool_spec, is_available as rag_is_available
 
 configure_logging()
 init_tracing("backend")
@@ -348,8 +348,18 @@ async def chat_stream(req: ChatRequest, principal: Principal = Depends(get_curre
             # real for the agent to remember, and it shouldn't bias the next
             # turn's context with an apology that wasn't really an answer.
             if not is_error:
+                # Marker appended ONLY in what the LLM sees back as its own
+                # history next turn -- never in `final_text` (already shown/
+                # spoken/persisted above, unmarked). See rag_tool.py's
+                # TOOL_VERIFIED_MARKER: without this, a wrong answer from a
+                # turn that skipped the tool got repeated verbatim on a
+                # later question in the same conversation, since history had
+                # no way to distinguish "checked" from "guessed."
+                history_text = final_text
+                if final_event.get("tool_call_count", 0) > 0:
+                    history_text = f"{final_text}\n{TOOL_VERIFIED_MARKER}"
                 _stream_history[history_key] = (
-                    history + [{"role": "user", "content": req.message}, {"role": "assistant", "content": final_text}]
+                    history + [{"role": "user", "content": req.message}, {"role": "assistant", "content": history_text}]
                 )[-_STREAM_MAX_HISTORY_MESSAGES:]
 
         # A failed turn (is_error) is shown to the user but never persisted —

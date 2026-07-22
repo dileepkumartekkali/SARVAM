@@ -34,6 +34,21 @@ _RETRY_DELAY_SECONDS = 0.5
 # clustered tightly (0.41-0.54) with no clean relevant/irrelevant gap.
 _TOP_K = 8
 
+# Real bug hit live, twice: (1) a WRONG answer already sitting earlier in a
+# conversation's history got repeated verbatim on a later, separate
+# question instead of re-checking -- history has no way to record "that
+# answer was tool-verified" vs. "the model just said it." (2) An abstract
+# prompt instruction telling the model not to trust its own prior turns
+# made this MEASURABLY WORSE, not better (0/3 tool calls in live re-testing,
+# vs. 1/3 before the instruction was added) -- models don't reliably
+# introspect their own past verification status from a meta-instruction
+# alone. What actually works: a concrete, visible marker appended to
+# history ONLY when this tool genuinely fired that turn (added by
+# api/main.py and supervisor/graph.py when building history, never shown to
+# the user), so the model has something textual to react to instead of an
+# abstract claim about its own past behavior.
+TOOL_VERIFIED_MARKER = "[This reply was verified via search_company_knowledge.]"
+
 
 def is_available() -> bool:
     return embeddings.is_configured() and store.is_configured()
@@ -80,6 +95,8 @@ def build_rag_tool_spec() -> ToolSpec:
         # got a different wrong name each time with the old wording, tool
         # never called. Rewritten to name the specific failure mode instead
         # of leaving the judgment call to the model.
+        # See TOOL_VERIFIED_MARKER above for the second bug this description
+        # now addresses (history repeating an unverified prior answer).
         description=(
             "Searches mTouch Labs' own real website content (services, leadership/CEO, "
             "vision, awards, case studies, etc.) for facts about the company. ALWAYS call "
@@ -87,7 +104,10 @@ def build_rag_tool_spec() -> ToolSpec:
             "the company, what services/products exist, awards won, case study details, and "
             "similar. These are private company details a general-purpose model was never "
             "trained on; a name or fact that seems familiar is still a guess, not real "
-            "knowledge — never answer from memory here, even if confident."
+            "knowledge — never answer from memory here, even if confident. If an earlier turn "
+            f'in this conversation is NOT immediately followed by "{TOOL_VERIFIED_MARKER}", '
+            "treat it as an unverified guess (even if it was your own prior answer) and call "
+            "this tool again rather than repeating it."
         ),
         parameters={"query": {"type": "string", "description": "what to search for, in the user's own words"}},
         required=["query"],

@@ -17,6 +17,7 @@ from ..agents.task_agent import CLARIFYING_QUESTION, ToolFn, run_turn
 from ..agents.translation_policy import decide_translation
 from ..llm_adapter.base import LLMRouter, ToolDefinition
 from ..security.confirmation import ConfirmationGate, PendingConfirmation
+from ..tools.rag_tool import TOOL_VERIFIED_MARKER
 from .state import SessionState
 
 
@@ -114,12 +115,21 @@ def build_text_graph(
         # never gets appended here -- feeding it back as if it were a real
         # past turn would pollute the LLM's own context on the NEXT turn,
         # same reasoning as not persisting/speaking it anywhere else.
+        # Marker appended ONLY in what the LLM sees back as its own history
+        # next turn -- never in `result.text` (already returned/persisted
+        # unmarked above). See rag_tool.TOOL_VERIFIED_MARKER: without this,
+        # a wrong answer from a turn that skipped the tool got repeated
+        # verbatim on a later question in the same conversation, since
+        # history had no way to distinguish "checked" from "guessed."
+        history_text = result.text
+        if result.tool_call_count > 0:
+            history_text = f"{result.text}\n{TOOL_VERIFIED_MARKER}"
         new_history = (
             history
             if result.error
             else history + [
                 {"role": "user", "content": state["user_message"]},
-                {"role": "assistant", "content": result.text},
+                {"role": "assistant", "content": history_text},
             ]
         )
         return {
