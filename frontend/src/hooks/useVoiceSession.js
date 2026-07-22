@@ -168,10 +168,12 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
           }
         },
       });
-      // An earlier key on this account had no bulbul:v3 access at all
-      // (confirmed live, see agent_core/speech/sarvam_tts.py's own note) --
-      // switched to a key with real v3 access; back to v3 by default.
-      const ws = socket.connectTTS({ language: ttsLanguage, model: "bulbul:v3" });
+      // Real bug hit live, twice: every key tried on this account so far
+      // is rejected by Sarvam's own server for bulbul:v3 (confirmed
+      // directly in production logs, see agent_core/speech/sarvam_tts.py's
+      // own note) -- "bulbul:v2" is proven, repeatedly, with real audio
+      // bytes returned.
+      const ws = socket.connectTTS({ language: ttsLanguage, model: "bulbul:v2" });
       const opened = withTimeout(
         new Promise((resolve) => ws.addEventListener("open", resolve)),
         TTS_OPEN_TIMEOUT_MS

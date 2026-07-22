@@ -74,16 +74,19 @@ _LANGUAGE_TO_SARVAM_CODE = {
     "en": "en-IN",
 }
 
-# A real, live-confirmed bug briefly lived here: an earlier key on this
-# account had no bulbul:v3 access at all -- every v3-only speaker
-# ("shubh", the default below, included) was rejected as "not compatible
-# with model bulbul:v2," so v2 was temporarily made the default. Switched
-# to a key with real v3 access; back to v3 by default. NOT independently
-# re-verified against a live v3-enabled key from this environment (this
-# repo's own dev key still lacks v3 access) -- confirm live once the real
-# deployed key is updated. Kept model-aware (matching this file's own
-# _PACE_RANGES pattern) so a key without v3 access degrades to a real
-# error rather than a wrong/incompatible speaker being silently sent.
+# Real bug hit live, TWICE: every key tried on this account so far has
+# been rejected by Sarvam's own server for bulbul:v3 -- "Speaker 'shubh'
+# is not compatible with model bulbul:v2" -- confirmed directly in
+# production logs, not a guess, even after a claimed key/plan change.
+# "bulbul:v2" + "anushka" is the one combination proven, repeatedly, with
+# real audio bytes returned. Kept model-aware (not a single flat default)
+# so bulbul:v3 stays a correct, ready-to-use path the moment a genuinely
+# v3-enabled key is confirmed -- see synthesize()'s own default and
+# every call site (all currently "bulbul:v2"). Before ever switching the
+# default back to v3, verify end-to-end with a real call like:
+#   SarvamTTSClient().synthesize(<texts>, language="en", model="bulbul:v3")
+# and confirm it returns real audio bytes, not a 422 -- do not just trust
+# that a key/plan change was applied correctly.
 _DEFAULT_SPEAKERS = {"bulbul:v2": "anushka", "bulbul:v3": "shubh"}
 
 
@@ -150,7 +153,7 @@ class SarvamTTSClient:
         text_chunks: AsyncIterator[str],
         *,
         language: str,
-        model: str = "bulbul:v3",
+        model: str = "bulbul:v2",
         voice: str | None = None,
         pace: float | None = None,
     ) -> AsyncIterator[bytes]:

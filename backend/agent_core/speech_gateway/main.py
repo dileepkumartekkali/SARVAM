@@ -271,11 +271,13 @@ async def tts_ws(websocket: WebSocket, tts_client_resolver=Depends(get_tts_clien
     try:
         config = json.loads(await websocket.receive_text())
         language = config["language"]
-        # An earlier key on this account had no bulbul:v3 access at all
-        # (confirmed live, see agent_core/speech/sarvam_tts.py's own note) --
-        # switched to a key with real v3 access; back to v3 by default. The
-        # frontend also sends this explicitly (useVoiceSession.js).
-        model = config.get("model", "bulbul:v3")
+        # Real bug hit live, twice: every key tried on this account so far
+        # is rejected by Sarvam's own server for bulbul:v3 (confirmed
+        # directly in production logs, see agent_core/speech/sarvam_tts.py's
+        # own note) -- "bulbul:v2" is proven, repeatedly, with real audio
+        # bytes returned. The frontend also sends this explicitly
+        # (useVoiceSession.js) -- this is just the fallback default.
+        model = config.get("model", "bulbul:v2")
         voice = config.get("voice")
         pace = config.get("pace")
     except (WebSocketDisconnect, json.JSONDecodeError, KeyError):

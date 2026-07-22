@@ -86,14 +86,18 @@ class SpeechTTSClient(Protocol):
         text_chunks: AsyncIterator[str],
         *,
         language: str,
-        # Was temporarily "bulbul:v2" -- the account's key at the time
-        # didn't have v3 access, confirmed live (every v3 speaker rejected
-        # as "not compatible with model bulbul:v2"). Switched back to v3 on
-        # request after a plan/key change; NOT independently re-verified
-        # here (this repo's own dev key still lacks v3 access) -- confirm
-        # live once the real deployed key is updated. v2 uses pitch/
-        # loudness; v3 uses temperature instead -- model-aware config either way.
-        model: str = "bulbul:v3",
+        # Real bug hit live, twice now: whichever Sarvam API key is
+        # actually deployed does not have bulbul:v3 access -- confirmed
+        # DIRECTLY in production logs (not a guess): "Speaker 'shubh' is
+        # not compatible with model bulbul:v2", Sarvam's own server
+        # response, on the real deployed key. v3 was tried on request
+        # after a claimed plan/key change, but that change did not
+        # actually grant v3 access to the key in use. Back to "bulbul:v2",
+        # which is proven -- repeatedly, with real audio bytes returned --
+        # to work with this account. Switch back to v3 only after
+        # confirming a v3-enabled key end-to-end (see sarvam_tts.py's
+        # synthesize() docstring for exactly what to verify first).
+        model: str = "bulbul:v2",
         voice: str | None = None,
         pace: float | None = None,
     ) -> AsyncIterator[bytes]:
