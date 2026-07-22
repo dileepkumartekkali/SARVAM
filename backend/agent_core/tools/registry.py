@@ -66,6 +66,9 @@ class ToolRegistry:
             "native tool-calling mechanism. If that isn't available, call one by",
             'outputting a line of the exact form: TOOL_CALL: {"name": "<tool_name>", '
             '"args": {<argument object>}}',
+            "That line must be the ENTIRE reply — no lead-in like \"I'll search "
+            "for that\" or \"Let me check\" before it. Any text before TOOL_CALL "
+            "gets shown/spoken to the user before the tool result exists.",
             "Only call a tool when you genuinely need it — never fabricate a",
             "result a tool could have given you, and never claim to have called",
             "a tool you didn't.",

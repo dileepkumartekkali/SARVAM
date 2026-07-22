@@ -62,6 +62,15 @@ class TurnResult:
     self_check_reason: str
     cancelled: bool = False
     pending_confirmation: PendingConfirmation | None = None
+    # True only when `text` is LLM_UNAVAILABLE_APOLOGY from the provider-
+    # failure branch below -- not a real answer. Real bug hit live: without
+    # this flag, every caller (stream_turn's tool-call fallback, the plain
+    # /chat endpoint, the LangGraph checkpointer's own history) had no way
+    # to tell "run_turn succeeded" from "run_turn's own internal apology,"
+    # so the apology got spoken/persisted/fed back into context exactly
+    # like a real answer -- the same class of bug already fixed once for
+    # stream_turn's own top-level failure, just missed here.
+    error: bool = False
 
 
 def _build_system_prompt(
@@ -272,7 +281,17 @@ async def _self_check(
 # (`_parse_tool_call`'s own convention) rather than native structured tool
 # calls, since a provider's token-streaming mode doesn't carry those.
 
-_TOOL_CALL_SNIFF_CHARS = 40  # enough to recognize "TOOL_CALL:" as the whole reply, never mid-prose
+# 96, not the original 40 -- real bug hit live: the assumption that a tool
+# call is always the standalone whole reply ("TOOL_CALL: {...}" and nothing
+# else) is false. The model was observed prefixing a short conversational
+# lead-in first -- "I'll search for that.TOOL_CALL: {...}" / "Let me
+# check.TOOL_CALL: {...}" -- which a `startswith` check can never catch,
+# and that preamble plus the raw JSON leaked straight to the UI and got
+# spoken aloud by TTS. 96 chars comfortably covers lead-ins like those
+# actually observed; a longer preamble before the marker would still slip
+# past this window -- a real, documented remaining risk, not a redesign of
+# the whole streaming/tool-calling trade-off.
+_TOOL_CALL_SNIFF_CHARS = 96
 
 
 class _ToolCallDetected(Exception):
@@ -282,10 +301,11 @@ class _ToolCallDetected(Exception):
 
 
 async def _sniff_and_forward(raw_stream: AsyncIterator[str]) -> AsyncIterator[str]:
-    """Buffers the first ~40 chars (or first line) of a raw token stream
-    before forwarding anything, so a `TOOL_CALL: {...}` response — always a
-    standalone reply by prompt convention, never buried after real prose —
-    is caught before any of it is ever shown or spoken."""
+    """Buffers the first ~96 chars (or first line) of a raw token stream
+    before forwarding anything, checking whether a `TOOL_CALL: {...}` marker
+    appears ANYWHERE in that window (not just as a strict prefix — see
+    _TOOL_CALL_SNIFF_CHARS's comment for why `startswith` alone was wrong in
+    production), so it's caught before any of it is ever shown or spoken."""
     buffered = ""
     sniffed = False
     async for delta in raw_stream:
@@ -295,12 +315,12 @@ async def _sniff_and_forward(raw_stream: AsyncIterator[str]) -> AsyncIterator[st
         buffered += delta
         if "\n" in buffered or len(buffered) >= _TOOL_CALL_SNIFF_CHARS:
             sniffed = True
-            if buffered.lstrip().startswith("TOOL_CALL:"):
+            if "TOOL_CALL:" in buffered:
                 raise _ToolCallDetected()
             yield buffered
     if not sniffed:
         # Stream ended before hitting the sniff threshold (a very short reply).
-        if buffered.lstrip().startswith("TOOL_CALL:"):
+        if "TOOL_CALL:" in buffered:
             raise _ToolCallDetected()
         if buffered:
             yield buffered
@@ -360,7 +380,8 @@ async def stream_turn(
                 tool_manifest=tool_manifest,
                 history=history,
             )
-            yield {"type": "text_delta", "text": result.text}
+            if not result.error:
+                yield {"type": "text_delta", "text": result.text}
             yield {
                 "type": "done",
                 "text": result.text,
@@ -369,6 +390,7 @@ async def stream_turn(
                 "self_check_ok": result.self_check_ok,
                 "self_check_reason": result.self_check_reason,
                 "pending_confirmation": result.pending_confirmation,
+                "error": result.error,
             }
             return
         except LLMProviderError:
@@ -508,6 +530,7 @@ async def run_turn(
                         tool_call_count=tool_call_count,
                         self_check_ok=True,
                         self_check_reason="",
+                        error=True,
                     )
 
                 calls: list[ToolCall] = list(result.tool_calls)

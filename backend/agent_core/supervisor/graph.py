@@ -109,10 +109,19 @@ def build_text_graph(
         # The RAW user message goes into history (not the directive-prefixed
         # variant run_turn builds) — directives are per-turn steering, and
         # replaying stale ones from history would fight the current turn's.
-        new_history = history + [
-            {"role": "user", "content": state["user_message"]},
-            {"role": "assistant", "content": result.text},
-        ]
+        #
+        # `result.error` (the provider-failure apology, not a real answer)
+        # never gets appended here -- feeding it back as if it were a real
+        # past turn would pollute the LLM's own context on the NEXT turn,
+        # same reasoning as not persisting/speaking it anywhere else.
+        new_history = (
+            history
+            if result.error
+            else history + [
+                {"role": "user", "content": state["user_message"]},
+                {"role": "assistant", "content": result.text},
+            ]
+        )
         return {
             "response": result.text,
             "prompt_version": result.prompt_version,
@@ -120,6 +129,7 @@ def build_text_graph(
             "self_check_ok": result.self_check_ok,
             "pending_confirmation": result.pending_confirmation,
             "history": new_history[-_MAX_HISTORY_MESSAGES:],
+            "error": result.error,
         }
 
     graph = StateGraph(TextGraphState)

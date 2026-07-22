@@ -158,6 +158,12 @@ class ChatResponse(BaseModel):
     # configured) — the frontend needs this to later attach a replay audio
     # path to the right row once TTS finishes (see chat_store.set_message_audio_path).
     message_id: str | None = None
+    # True when `response` is the provider-failure apology, not a real
+    # answer -- mirrors /chat/stream's "done" event so a caller can equally
+    # choose not to speak/persist it (this endpoint itself already skips
+    # persistence below when this is set; kept in the response too for any
+    # other caller, e.g. load_test.py/chaos_test.py, that inspects it).
+    error: bool = False
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -214,8 +220,9 @@ async def chat(
     # caller is waiting on -- it runs as a background task AFTER the response
     # below is already sent. The id is generated here (not by Postgres) so it
     # can be returned immediately for the audio-replay upload to target.
+    is_error = result.get("error", False)
     assistant_message_id = None
-    if persistence_on:
+    if persistence_on and not is_error:
         assistant_message_id = str(uuid.uuid4())
         background_tasks.add_task(
             chat_store.record_turn,
@@ -241,6 +248,7 @@ async def chat(
             else None
         ),
         message_id=assistant_message_id,
+        error=is_error,
     )
 
 

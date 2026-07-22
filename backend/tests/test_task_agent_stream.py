@@ -21,6 +21,25 @@ async def noop_tool(**kwargs) -> str:
     return "ok"
 
 
+class _ToolCallThenProviderFailure:
+    """Sniffed as a tool call by stream_turn (its `stream()`), but run_turn's
+    OWN subsequent dispatch call (`complete_with_tools`) fails entirely --
+    reproduces the real bug: run_turn returns TurnResult(error=True) from
+    deep inside its tool loop, which stream_turn's fallback branch must not
+    treat as a real answer."""
+
+    name = "fails-after-tool-call"
+
+    async def stream(self, messages, *, system=None, max_tokens=None, temperature=None):
+        yield 'TOOL_CALL: {"name": "noop", "args": {}}'
+
+    async def complete_with_tools(self, messages, *, system=None, tools=None, max_tokens=None, temperature=None):
+        raise LLMProviderError("boom", retriable=False)
+
+    async def complete(self, messages, *, system=None, max_tokens=None, temperature=None):
+        raise LLMProviderError("boom", retriable=False)
+
+
 async def test_stream_turn_yields_text_deltas_then_done_on_plain_reply():
     provider = ScriptedProvider(["Hello there. How are you today?", "OK"])
     router = LLMRouter([provider])
@@ -68,6 +87,57 @@ async def test_stream_turn_falls_back_to_run_turn_on_tool_call_prefix():
     assert done["text"] == "done"
     assert done["tool_call_count"] == 1
     assert done["self_check_ok"] is True
+
+
+async def test_stream_turn_catches_tool_call_even_with_a_conversational_lead_in():
+    """Real bug hit live: the model doesn't always emit TOOL_CALL: as the
+    ENTIRE reply -- it was observed prefixing "I'll search for that." /
+    "Let me check." first. A `startswith`-only sniff never catches that, so
+    the lead-in AND the raw TOOL_CALL JSON leaked to the UI and got spoken
+    by TTS. Same four-call shape as the prefix-only case above."""
+    provider = ScriptedProvider(
+        [
+            'I\'ll search for that.TOOL_CALL: {"name": "noop", "args": {}}',
+            'TOOL_CALL: {"name": "noop", "args": {}}',
+            "done",
+            "OK",
+        ]
+    )
+    router = LLMRouter([provider])
+
+    events = [
+        e async for e in stream_turn(_session(), router, "what time is it", tools={"noop": noop_tool})
+    ]
+
+    for e in events:
+        if e["type"] == "text_delta":
+            assert "TOOL_CALL" not in e["text"]
+            assert "search for that" not in e["text"]
+
+    done = events[-1]
+    assert done["type"] == "done"
+    assert done["text"] == "done"
+    assert done["tool_call_count"] == 1
+
+
+async def test_stream_turn_never_leaks_run_turns_internal_apology_as_a_delta():
+    """Real bug hit live: run_turn's OWN tool-dispatch loop can hit
+    LLMProviderError and return the apology as TurnResult.error=True --
+    stream_turn's tool-call fallback branch used to yield that unconditionally
+    as a text_delta, so the fake apology got shown/spoken exactly like a
+    real answer. Must now suppress the delta and mark the done event as an
+    error, same contract as the top-level failure path."""
+    router = LLMRouter([_ToolCallThenProviderFailure()])
+
+    events = [
+        e async for e in stream_turn(_session(), router, "what time is it", tools={"noop": noop_tool})
+    ]
+
+    assert all(e["type"] != "text_delta" for e in events)
+    done = events[-1]
+    assert done["type"] == "done"
+    assert done["error"] is True
+    assert "trouble" in done["text"].lower()
 
 
 async def test_stream_turn_self_check_failure_is_logged_not_corrected():
