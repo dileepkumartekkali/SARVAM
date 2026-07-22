@@ -96,7 +96,9 @@ _graph = build_text_graph(
 # kept independent since production traffic uses one endpoint exclusively
 # (the other stays as a non-streaming reference for load_test.py/chaos_test.py).
 _STREAM_MAX_HISTORY_MESSAGES = 20
-_stream_history: dict[str, list[dict]] = {}
+# Keyed by (user_id, thread_id), not thread_id alone -- see chat_stream's
+# own comment on why (a client-supplied thread_id was never ownership-checked).
+_stream_history: dict[tuple[str, str], list[dict]] = {}
 # One gate for the process, not per-request — a confirmation issued on turn N
 # must still be redeemable on turn N+1 (same reasoning as build_text_graph's).
 _stream_confirmation_gate = ConfirmationGate() if _tool_registry.write_scope_names() else None
@@ -308,7 +310,17 @@ async def chat_stream(req: ChatRequest, principal: Principal = Depends(get_curre
             pending = None
             yield _sse_event({"type": "text_delta", "text": final_text})
         else:
-            history = _stream_history.get(req.thread_id, [])
+            # Real gap caught in a pre-deploy sweep: conversation_id is
+            # ownership-checked above, but thread_id is a SEPARATE
+            # client-supplied field that was never checked against anything
+            # -- keying this dict by thread_id alone meant any authenticated
+            # caller who happened to send someone else's thread_id (leaked
+            # via a log line, a shared link, a referrer) would read that
+            # user's prior turns back into their own context. Keying by
+            # (subject, thread_id) makes that impossible regardless of
+            # where thread_id came from.
+            history_key = (principal.subject, req.thread_id)
+            history = _stream_history.get(history_key, [])
             final_event = None
             async for event in stream_turn(
                 session,
@@ -336,7 +348,7 @@ async def chat_stream(req: ChatRequest, principal: Principal = Depends(get_curre
             # real for the agent to remember, and it shouldn't bias the next
             # turn's context with an apology that wasn't really an answer.
             if not is_error:
-                _stream_history[req.thread_id] = (
+                _stream_history[history_key] = (
                     history + [{"role": "user", "content": req.message}, {"role": "assistant", "content": final_text}]
                 )[-_STREAM_MAX_HISTORY_MESSAGES:]
 

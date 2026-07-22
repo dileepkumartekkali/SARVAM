@@ -180,13 +180,26 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
         }),
         TTS_CLOSE_TIMEOUT_MS
       );
+      // Real gap caught in a pre-deploy sweep: if `opened` only ever
+      // resolved via the timeout fallback (socket never actually opened —
+      // cold gateway, dropped network), every sendChunk below silently
+      // no-ops forever. Unlike the explicit "error"/"text_only_fallback"
+      // event path above, nothing ever told the user why no audio played —
+      // the text reply just appeared with silence. Surfaced once, not per
+      // chunk, the first time this is detected.
+      let notifiedUnavailable = false;
       return {
         async sendChunk(chunk) {
           await opened;
           // Guards against the timeout (not a real "open") having resolved
           // this — sendText already no-ops if the socket isn't OPEN, but
           // being explicit here documents why that matters.
-          if (ws.readyState === WebSocket.OPEN) socket.sendText(chunk);
+          if (ws.readyState === WebSocket.OPEN) {
+            socket.sendText(chunk);
+          } else if (!notifiedUnavailable) {
+            notifiedUnavailable = true;
+            addMessage("assistant", "Voice reply unavailable: couldn't connect for audio in time.");
+          }
         },
         async finish() {
           await opened;
@@ -260,14 +273,26 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
               });
               if (doneEvent.message_id) setMessageServerId(assistantId, doneEvent.message_id);
               finishMessage(assistantId);
+              // Real bug hit live: this used to `await speakSession.finish()`
+              // (which waits for the TTS socket to actually CLOSE, bounded
+              // but still up to TTS_CLOSE_TIMEOUT_MS) before resolving --
+              // the composer stayed disabled the whole time, even though
+              // nothing about typing a NEXT message depends on the previous
+              // reply's audio having finished closing/saving. Detached, same
+              // "don't make the user wait on background work" pattern as the
+              // backend's own chat_store.record_turn.
               if (speakSession) {
-                const blob = await speakSession.finish();
-                saveReplyAudio({
-                  userId,
-                  messageServerId: doneEvent.message_id,
-                  blob,
-                  onSaved: setMessageAudioPath,
-                }).catch(() => {});
+                speakSession
+                  .finish()
+                  .then((blob) =>
+                    saveReplyAudio({
+                      userId,
+                      messageServerId: doneEvent.message_id,
+                      blob,
+                      onSaved: setMessageAudioPath,
+                    })
+                  )
+                  .catch(() => {});
               } else {
                 setVoiceState(VoiceState.IDLE);
               }

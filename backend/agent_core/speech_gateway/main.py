@@ -255,6 +255,17 @@ async def stt_ws(websocket: WebSocket, stt_client: SpeechSTTClient = Depends(get
 
 @gateway_app.websocket("/ws/tts")
 async def tts_ws(websocket: WebSocket, tts_client_resolver=Depends(get_tts_client_resolver)):
+    # Real gap hit in a pre-deploy sweep: this was the only one of the three
+    # voice-cost websockets (stt_ws, converse_ws both check) that accepted
+    # unconditionally -- a client could open unlimited /ws/tts connections
+    # and drive unbounded billed Sarvam synthesis calls, sidestepping the
+    # exact abuse control rate_limit.py was built for.
+    client_key = websocket.client.host if websocket.client else "unknown"
+    if not _session_rate_limiter.allow(client_key):
+        errors_total.labels(stage="rate_limit").inc()
+        await _safe_close(websocket, code=1008, reason="rate limit exceeded")
+        return
+
     await websocket.accept()
     active_websocket_connections.labels(kind="tts").inc()
     try:

@@ -25,8 +25,8 @@ _REQUEST_BODY = {
 }
 
 
-def _auth_header(secret="test-secret", exp_delta=3600):
-    token = jwt.encode({"sub": "user-1", "exp": int(time.time()) + exp_delta}, secret, algorithm="HS256")
+def _auth_header(secret="test-secret", exp_delta=3600, subject="user-1"):
+    token = jwt.encode({"sub": subject, "exp": int(time.time()) + exp_delta}, secret, algorithm="HS256")
     return {"Authorization": f"Bearer {token}"}
 
 
@@ -90,3 +90,36 @@ def test_chat_stream_low_confidence_never_reaches_the_answer_llm(monkeypatch):
     combined = "".join(e["text"] for e in events if e["type"] == "text_delta")
     assert "?" in combined  # the deterministic clarifying question
     assert provider.call_count == 1
+
+
+def test_chat_stream_history_is_isolated_per_user_not_just_thread_id(monkeypatch):
+    """Real gap caught in a pre-deploy sweep: _stream_history used to be
+    keyed by thread_id alone -- conversation_id is ownership-checked, but
+    thread_id is a separate client-supplied field that wasn't. Two
+    different authenticated users sending the SAME thread_id must never
+    see each other's history."""
+    monkeypatch.setenv("JWT_SIGNING_SECRET", "test-secret")
+    provider = ScriptedProvider(
+        ["Nice to meet you, Alice.", "OK", "I don't know your name.", "OK"]
+    )
+    monkeypatch.setattr(main_module, "_router", LLMRouter([provider]))
+    client = TestClient(app)
+
+    shared_body = {**_REQUEST_BODY, "thread_id": "shared-thread"}
+    client.post(
+        "/chat/stream",
+        json={**shared_body, "message": "my name is Alice"},
+        headers=_auth_header(subject="user-1"),
+    )
+
+    client.post(
+        "/chat/stream",
+        json={**shared_body, "message": "what is my name"},
+        headers=_auth_header(subject="user-2"),
+    )
+
+    # user-2's call must not have Alice's turn anywhere in its messages --
+    # the SAME thread_id belonging to a different user is a fresh history.
+    second_call_messages = provider.messages_by_call[2]
+    combined = " ".join(str(m["content"]) for m in second_call_messages)
+    assert "Alice" not in combined

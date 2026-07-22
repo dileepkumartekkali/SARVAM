@@ -207,3 +207,34 @@ def test_rate_limit_rejection_increments_error_metric():
         pass  # a 1008 policy-violation close surfaces as a client-side error here — expected
 
     assert rate_limit_error_count() == before + 1
+
+
+def test_tts_ws_is_also_rate_limited():
+    """Real gap caught in a pre-deploy sweep: /ws/tts was the only one of
+    the three voice-cost websockets that accepted unconditionally, with no
+    rate check at all -- a client could open unlimited connections and
+    drive unbounded billed synthesis calls. Same shape as the /ws/stt test
+    above, just proving tts_ws now shares the same guard."""
+    from agent_core.observability.metrics import errors_total
+    from agent_core.speech_gateway.main import _session_rate_limiter
+
+    def rate_limit_error_count():
+        for metric in errors_total.collect():
+            for sample in metric.samples:
+                if sample.labels.get("stage") == "rate_limit" and sample.name.endswith("_total"):
+                    return sample.value
+        return 0.0
+
+    before = rate_limit_error_count()
+
+    for _ in range(_session_rate_limiter._max_requests):
+        _session_rate_limiter.allow("testclient")
+
+    client = TestClient(gateway_app)
+    try:
+        with client.websocket_connect("/ws/tts"):
+            pass
+    except Exception:
+        pass  # a 1008 policy-violation close surfaces as a client-side error here — expected
+
+    assert rate_limit_error_count() == before + 1
