@@ -164,7 +164,21 @@ def _script_based_detect(text: str) -> LanguageDetectionResult | None:
 # --- Romanized code-mix keywords (deterministic, no network) ----------------
 
 _ROMANIZED_MARKERS: dict[str, set[str]] = {
-    "te": {"vasthunnava", "vachindi", "enti", "chesav", "cheppu", "unnav"},
+    # Real bug hit live: "evaru" (who), "epudu" (when), "ayindhi"/"ayyindi"
+    # (happened/started) were all missing -- confirmed via repeated direct
+    # calls that queries using them (e.g. "mtouch labs ceo evaru?") fell
+    # through to the LLM classifier as a last resort, which then
+    # inconsistently misclassified the SAME exact text as Kannada at 0.95
+    # confidence 2 times out of 3 -- high enough to bypass the low-
+    # confidence safety net entirely. Added here so these common words are
+    # caught deterministically, matching this module's own stated
+    # principle: real coverage should grow the keyword list for confirmed
+    # cases, not lean further on an LLM fallback that's already proven
+    # unreliable for exactly this kind of short, weak-signal input.
+    "te": {
+        "vasthunnava", "vachindi", "enti", "chesav", "cheppu", "unnav",
+        "evaru", "epudu", "ayindhi", "ayyindi", "undi", "chesthundi", "ante",
+    },
 }
 
 

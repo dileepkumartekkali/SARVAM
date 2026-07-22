@@ -33,4 +33,13 @@ CODE_MIXED_CASES = [
     ("Enna panra ippo, meeting late aayiduma?", "ta", True),
     ("Tumi ki korcho ekhon, office ja bo na?", "bn", True),
     ("Tera plan ki hai aj, ghar aavega ki nahi?", "pa", True),
+    # Real bug hit live: "mtouch labs ceo evaru?" (no marker word in the
+    # original list) fell through to the LLM classifier, which
+    # inconsistently misclassified the SAME exact text as Kannada at 0.95
+    # confidence 2 times out of 3 across repeated real calls -- high enough
+    # to bypass the low-confidence safety net entirely. "evaru"/"epudu"/
+    # "ayindhi" added to the deterministic keyword list so this class of
+    # query is now caught without ever touching the unreliable LLM path.
+    ("mtouch labs ceo evaru?", "te", False),
+    ("mtouch labs ceo evaru and epudu start ayindhi?", "te", False),
 ]
