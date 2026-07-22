@@ -10,8 +10,21 @@ tiered instead of merged into every turn.
 
 from __future__ import annotations
 
+import asyncio
+
 from ..rag import embeddings, store
 from .registry import ToolSpec
+
+# One retry, not zero -- real gap: embeddings.EmbeddingError already carried
+# a `retriable` flag (true for HF's transient 503 "model loading" / 429
+# rate-limit responses) but nothing anywhere ever actually retried on it, so
+# a purely transient hiccup permanently failed the whole tool call mid-turn,
+# which is exactly the shape of the "trouble getting an answer" apology
+# users were seeing. A short fixed delay, not chat_store.record_turn's 3
+# attempts -- this runs inline during a live turn, where the whole point of
+# streaming is not adding wasted latency.
+_MAX_EMBED_ATTEMPTS = 2
+_RETRY_DELAY_SECONDS = 0.5
 
 # 8, not the original 4 -- live testing against the real ingested chunks
 # showed a genuinely relevant page (Leadership Team, for "who is the CEO")
@@ -26,12 +39,25 @@ def is_available() -> bool:
     return embeddings.is_configured() and store.is_configured()
 
 
+async def _embed_with_retry(query: str) -> list[float]:
+    last_error: embeddings.EmbeddingError | None = None
+    for attempt in range(_MAX_EMBED_ATTEMPTS):
+        try:
+            return await embeddings.embed_text(query)
+        except embeddings.EmbeddingError as e:
+            last_error = e
+            if not e.retriable or attempt == _MAX_EMBED_ATTEMPTS - 1:
+                raise
+            await asyncio.sleep(_RETRY_DELAY_SECONDS)
+    raise last_error  # unreachable, satisfies static analysis
+
+
 async def search_company_knowledge(query: str) -> str:
     """Embeds `query` (whatever language it's in -- bge-m3 is cross-lingual,
     no translation step needed) and returns the most relevant chunks of
     mTouch Labs' own website content for the LLM to answer from."""
     try:
-        query_vector = await embeddings.embed_text(query)
+        query_vector = await _embed_with_retry(query)
     except embeddings.EmbeddingError as e:
         return f"Error: couldn't search company knowledge right now ({e})."
     results = await store.search(query_vector, top_k=_TOP_K)

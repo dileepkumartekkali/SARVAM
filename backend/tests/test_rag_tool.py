@@ -46,6 +46,8 @@ async def test_search_reports_no_results_plainly(monkeypatch):
 
 
 async def test_search_surfaces_embedding_failure_without_raising(monkeypatch):
+    monkeypatch.setattr(rag_tool, "_RETRY_DELAY_SECONDS", 0)  # don't slow the suite down for a real retry wait
+
     async def fake_embed_text(query, **kwargs):
         raise embeddings.EmbeddingError("HF is down", retriable=True)
 
@@ -53,6 +55,47 @@ async def test_search_surfaces_embedding_failure_without_raising(monkeypatch):
 
     result = await rag_tool.search_company_knowledge("anything")
 
+    assert "error" in result.lower()
+
+
+async def test_search_retries_once_on_a_retriable_failure_then_succeeds(monkeypatch):
+    """Real gap: EmbeddingError.retriable existed but nothing ever actually
+    retried on it -- a purely transient HF hiccup (429 rate limit, 503
+    model-loading) permanently failed the whole tool call mid-turn. Now one
+    retry actually happens before giving up."""
+    monkeypatch.setattr(rag_tool, "_RETRY_DELAY_SECONDS", 0)
+    calls = []
+
+    async def fake_embed_text(query, **kwargs):
+        calls.append(query)
+        if len(calls) == 1:
+            raise embeddings.EmbeddingError("rate limited", retriable=True)
+        return [0.1, 0.2]
+
+    async def fake_search(query_vector, *, top_k):
+        return [{"chunk_id": "x", "page_url": "u", "page_title": "T", "text": "content", "distance": 0.1}]
+
+    monkeypatch.setattr(rag_tool.embeddings, "embed_text", fake_embed_text)
+    monkeypatch.setattr(rag_tool.store, "search", fake_search)
+
+    result = await rag_tool.search_company_knowledge("anything")
+
+    assert len(calls) == 2  # the retry actually happened
+    assert "content" in result
+
+
+async def test_search_does_not_retry_a_non_retriable_failure(monkeypatch):
+    calls = []
+
+    async def fake_embed_text(query, **kwargs):
+        calls.append(query)
+        raise embeddings.EmbeddingError("HF_API_TOKEN not set", retriable=False)
+
+    monkeypatch.setattr(rag_tool.embeddings, "embed_text", fake_embed_text)
+
+    result = await rag_tool.search_company_knowledge("anything")
+
+    assert len(calls) == 1  # no wasted retry on a config error that will never succeed
     assert "error" in result.lower()
 
 

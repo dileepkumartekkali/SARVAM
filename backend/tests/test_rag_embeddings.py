@@ -59,10 +59,17 @@ async def test_missing_token_is_non_retriable(monkeypatch):
     assert exc_info.value.retriable is False
 
 
-async def test_503_is_retriable_other_errors_are_not(monkeypatch):
+async def test_503_and_429_are_retriable_other_errors_are_not(monkeypatch):
     monkeypatch.setenv("HF_API_TOKEN", "test-token")
     transport = httpx.MockTransport(lambda request: httpx.Response(503, content=b"loading"))
 
+    with pytest.raises(embeddings.EmbeddingError) as exc_info:
+        await embeddings.embed_text("hello", transport=transport)
+    assert exc_info.value.retriable is True
+
+    # Real gap: HF's free-tier rate limit (429) used to be treated as
+    # permanent -- genuinely common under real load, not hypothetical.
+    transport = httpx.MockTransport(lambda request: httpx.Response(429, content=b"rate limited"))
     with pytest.raises(embeddings.EmbeddingError) as exc_info:
         await embeddings.embed_text("hello", transport=transport)
     assert exc_info.value.retriable is True

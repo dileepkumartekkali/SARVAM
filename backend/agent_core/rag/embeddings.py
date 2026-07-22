@@ -77,10 +77,14 @@ async def embed_text(
         resp = await client.post(url, json={"inputs": text}, headers=headers)
         if resp.status_code != 200:
             # 503 means the model is "loading" on HF's serverless
-            # infrastructure -- a transient cold-start, worth a retry;
-            # anything else (401 bad token, 404 model not hosted) is not.
+            # infrastructure -- a transient cold-start. 429 is the free
+            # tier's rate limit -- also transient, and genuinely common
+            # under real load, not a hypothetical (real gap: this used to
+            # mark only 503 as retriable, so a 429 failed permanently with
+            # no retry even though waiting a moment would likely succeed).
+            # Anything else (401 bad token, 404 model not hosted) is not.
             raise EmbeddingError(
                 f"HF embedding request failed: {resp.status_code} {resp.text}",
-                retriable=resp.status_code == 503,
+                retriable=resp.status_code in (503, 429),
             )
         return _pool_if_needed(resp.json())
