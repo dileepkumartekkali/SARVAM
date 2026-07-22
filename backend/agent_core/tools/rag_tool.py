@@ -13,7 +13,13 @@ from __future__ import annotations
 from ..rag import embeddings, store
 from .registry import ToolSpec
 
-_TOP_K = 4
+# 8, not the original 4 -- live testing against the real ingested chunks
+# showed a genuinely relevant page (Leadership Team, for "who is the CEO")
+# ranked 5th, just outside the old cutoff. The knowledge base is only ~111
+# small chunks total, so 8 is still cheap (~3-4k tokens), and a fixed
+# distance-threshold cutoff isn't safely tunable yet -- real query scores
+# clustered tightly (0.41-0.54) with no clean relevant/irrelevant gap.
+_TOP_K = 8
 
 
 def is_available() -> bool:
