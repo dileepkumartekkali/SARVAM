@@ -7,7 +7,7 @@ self-check failure being logged rather than corrected (no regeneration call
 
 from agent_core.agents.task_agent import stream_turn
 from agent_core.llm_adapter import LLMRouter
-from agent_core.llm_adapter.base import LLMProviderError
+from agent_core.llm_adapter.base import CompletionResult, LLMProviderError
 from agent_core.supervisor.state import Mode, SessionState
 
 from ._fakes import FakeProvider, ScriptedProvider
@@ -113,6 +113,58 @@ async def test_stream_turn_catches_tool_call_even_with_a_conversational_lead_in(
         if e["type"] == "text_delta":
             assert "TOOL_CALL" not in e["text"]
             assert "search for that" not in e["text"]
+
+    done = events[-1]
+    assert done["type"] == "done"
+    assert done["text"] == "done"
+    assert done["tool_call_count"] == 1
+
+
+class _ToolCallSplitAcrossNewline:
+    """Simulates real token-by-token streaming where a newline arrives in
+    an EARLIER delta than the TOOL_CALL marker that follows it on its own
+    line -- exactly the shape that leaked in production even after the
+    startswith-vs-in fix (ScriptedProvider yields a whole reply as one
+    atomic chunk, which can't reproduce this; a real provider's stream
+    can't be relied on to deliver "line 1\nline 2" as a single delta)."""
+
+    name = "split-across-newline"
+
+    def __init__(self):
+        self._dispatch_call_count = 0
+
+    async def stream(self, messages, *, system=None, max_tokens=None, temperature=None):
+        yield "Let me look that up.\n"  # delta 1 -- ends in a newline, no marker yet
+        yield 'TOOL_CALL: {"name": "noop", "args": {}}'  # delta 2 -- arrives separately, after it
+
+    async def complete_with_tools(self, messages, *, system=None, tools=None, max_tokens=None, temperature=None):
+        self._dispatch_call_count += 1
+        text = 'TOOL_CALL: {"name": "noop", "args": {}}' if self._dispatch_call_count == 1 else "done"
+        return CompletionResult(text=text, tool_calls=[])
+
+    async def complete(self, messages, *, system=None, max_tokens=None, temperature=None):
+        return "OK"  # self-check's reviewer call
+
+
+async def test_stream_turn_catches_tool_call_on_its_own_line_after_a_lead_in():
+    """Real bug hit live, a SECOND time: the previous fix (check `in` not
+    `startswith`) still leaked in production for a reply shaped like
+    "<lead-in line>\nTOOL_CALL: {...}" -- the newline after the lead-in
+    used to trigger the sniff's decision on THAT LINE ALONE (which has no
+    marker), permanently stopping all further checking before the actual
+    TOOL_CALL line ever arrived, delivered as a SEPARATE delta. A newline
+    can't be treated as a "safe, decided" signal when the model
+    legitimately puts its explanation and its tool call on separate lines."""
+    router = LLMRouter([_ToolCallSplitAcrossNewline()])
+
+    events = [
+        e async for e in stream_turn(_session(), router, "what time is it", tools={"noop": noop_tool})
+    ]
+
+    for e in events:
+        if e["type"] == "text_delta":
+            assert "TOOL_CALL" not in e["text"]
+            assert "look that up" not in e["text"]
 
     done = events[-1]
     assert done["type"] == "done"

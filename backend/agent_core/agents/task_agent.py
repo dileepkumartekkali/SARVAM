@@ -156,12 +156,23 @@ def _language_directive(session: SessionState, user_message: str) -> str:
             f" Write it in the same Latin/romanized script the user just typed in (a natural "
             f"'{name}lish' style, like they did) — do NOT switch to {name}'s native script."
         )
+    # Real bug hit live: without this exception, this directive's own
+    # "do not answer in English or any other language" -- placed right next
+    # to the query, closer/more emphatic than the tool manifest several
+    # hundred words earlier in the system prompt -- was observed making the
+    # model skip calling tools ENTIRELY for non-English turns and just
+    # hallucinate a plausible-sounding (wrong) answer instead of a real one,
+    # since TOOL_CALL: {...} is itself English/JSON and read as conflicting
+    # with "never English." Confirmed live: a Telugu company-fact query
+    # returned three DIFFERENT fabricated names across repeated attempts
+    # once this carve-out was missing.
+    tool_note = " (Using a tool via TOOL_CALL: {...} syntax is fine and expected when needed — that's not 'answering.')"
     if session.is_code_mixed:
         return (
             f"[Answer in {name}, naturally code-mixed with English the way the user just "
-            f"spoke — do not answer in plain English.{script_note}]"
+            f"spoke — do not answer in plain English.{script_note}{tool_note}]"
         )
-    return f"[Answer in {name}. Do not answer in English or any other language.{script_note}]"
+    return f"[Answer in {name}. Do not answer in English or any other language.{script_note}{tool_note}]"
 
 
 def _voice_brevity_directive(session: SessionState) -> str:
@@ -281,17 +292,24 @@ async def _self_check(
 # (`_parse_tool_call`'s own convention) rather than native structured tool
 # calls, since a provider's token-streaming mode doesn't carry those.
 
-# 96, not the original 40 -- real bug hit live: the assumption that a tool
-# call is always the standalone whole reply ("TOOL_CALL: {...}" and nothing
-# else) is false. The model was observed prefixing a short conversational
-# lead-in first -- "I'll search for that.TOOL_CALL: {...}" / "Let me
-# check.TOOL_CALL: {...}" -- which a `startswith` check can never catch,
-# and that preamble plus the raw JSON leaked straight to the UI and got
-# spoken aloud by TTS. 96 chars comfortably covers lead-ins like those
-# actually observed; a longer preamble before the marker would still slip
-# past this window -- a real, documented remaining risk, not a redesign of
-# the whole streaming/tool-calling trade-off.
-_TOOL_CALL_SNIFF_CHARS = 96
+# 200, and no longer stopping at the first newline either -- TWO real bugs
+# hit live, in order: (1) the original `startswith` check assumed a tool
+# call is always the standalone whole reply, but the model was observed
+# prefixing a short conversational lead-in first ("I'll search for
+# that.TOOL_CALL: {...}"), so `startswith` never matched and the lead-in
+# plus raw JSON leaked to the UI/TTS -- fixed by checking `in` instead of
+# `startswith`. (2) THAT fix still leaked in production for a Telugu
+# reply structured as "<explanation line>\nTOOL_CALL: {...}" -- the
+# newline in the explanation line (well under any reasonable char count)
+# triggered `sniffed = True` on line 1 ALONE, which contains no marker, so
+# the code concluded "safe" and permanently stopped checking anything
+# after that newline, including the actual TOOL_CALL line right behind
+# it. A newline is NOT a reliable "the reply is finished/decided" signal
+# when a model can legitimately put its explanation and its tool call on
+# separate lines. Sniffing now continues across newlines, relying purely
+# on the character cap to bound how long a real chatty answer gets held
+# back before streaming starts.
+_TOOL_CALL_SNIFF_CHARS = 200
 
 
 class _ToolCallDetected(Exception):
@@ -301,11 +319,11 @@ class _ToolCallDetected(Exception):
 
 
 async def _sniff_and_forward(raw_stream: AsyncIterator[str]) -> AsyncIterator[str]:
-    """Buffers the first ~96 chars (or first line) of a raw token stream
-    before forwarding anything, checking whether a `TOOL_CALL: {...}` marker
-    appears ANYWHERE in that window (not just as a strict prefix — see
-    _TOOL_CALL_SNIFF_CHARS's comment for why `startswith` alone was wrong in
-    production), so it's caught before any of it is ever shown or spoken."""
+    """Buffers the first ~200 chars of a raw token stream before forwarding
+    anything, checking whether a `TOOL_CALL: {...}` marker appears ANYWHERE
+    in that window -- including after a newline, e.g. an explanation line
+    followed by the marker on its own line (see _TOOL_CALL_SNIFF_CHARS's
+    comment for why a newline can't be treated as an early "safe" signal)."""
     buffered = ""
     sniffed = False
     async for delta in raw_stream:
@@ -313,13 +331,13 @@ async def _sniff_and_forward(raw_stream: AsyncIterator[str]) -> AsyncIterator[st
             yield delta
             continue
         buffered += delta
-        if "\n" in buffered or len(buffered) >= _TOOL_CALL_SNIFF_CHARS:
+        if len(buffered) >= _TOOL_CALL_SNIFF_CHARS:
             sniffed = True
             if "TOOL_CALL:" in buffered:
                 raise _ToolCallDetected()
             yield buffered
     if not sniffed:
-        # Stream ended before hitting the sniff threshold (a very short reply).
+        # Stream ended before hitting the sniff threshold (a short reply).
         if "TOOL_CALL:" in buffered:
             raise _ToolCallDetected()
         if buffered:
