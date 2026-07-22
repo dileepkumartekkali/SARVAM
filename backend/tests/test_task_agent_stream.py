@@ -110,6 +110,39 @@ async def test_stream_turn_survives_forced_retrieval_raising_unexpectedly():
     assert done["text"] == "I don't have that information handy."
 
 
+async def test_stream_turn_keeps_language_directive_adjacent_to_the_query_even_with_forced_context():
+    """Real bug hit live: forced retrieval used to sit BETWEEN the language
+    directive and the user's own message -- several hundred words of
+    English retrieved text separating them, defeating the entire reason
+    the directive is placed directly next to the query (fast models follow
+    an adjacent instruction far more reliably than one buried earlier).
+    Confirmed live: a correctly-detected Telugu, code-mixed query answered
+    in plain English 3/3 times with the old ordering."""
+    provider = ScriptedProvider(["ఇది తెలుగు సమాధానం", "OK"])
+    router = LLMRouter([provider])
+
+    async def fake_search(query: str) -> str:
+        return "REAL FACT: some retrieved English website content."
+
+    session = _session(Mode.TEXT_TO_SPEECH).model_copy(update={"response_language": "te", "is_code_mixed": True})
+    events = [
+        e async for e in stream_turn(
+            session, router, "mtouch labs ceo evaru?",
+            tools={"search_company_knowledge": fake_search},
+        )
+    ]
+    assert events
+
+    first_call_content = provider.messages_by_call[0][0]["content"]
+    fact_index = first_call_content.index("REAL FACT")
+    directive_index = first_call_content.index("Answer in Telugu")
+    query_index = first_call_content.index("mtouch labs ceo evaru?")
+    # Retrieved fact first, then the directive, then IMMEDIATELY the raw query.
+    assert fact_index < directive_index < query_index
+    between = first_call_content[directive_index:query_index]
+    assert "REAL FACT" not in between
+
+
 async def test_stream_turn_does_not_force_retrieval_when_company_not_named():
     provider = ScriptedProvider(["I don't have that information.", "OK"])
     router = LLMRouter([provider])

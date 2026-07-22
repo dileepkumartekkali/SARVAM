@@ -224,12 +224,21 @@ async def _forced_company_context(user_message: str, tools: dict[str, ToolFn] | 
         return None
 
 
-def _with_forced_context(user_message: str, forced_context: str | None) -> str:
+def _with_forced_context(directive_and_message: str, forced_context: str | None) -> str:
+    """Prepends the forced-retrieval block BEFORE the directive+message
+    combo, never between them. Real bug hit live: this used to sit between
+    the language directive and the user's own message -- several hundred
+    words of English retrieved website text, defeating the entire reason
+    `_language_directive` is placed directly adjacent to the query in the
+    first place (see its own docstring: fast/small models follow an
+    instruction next to the query far more reliably than one buried
+    earlier). Confirmed live: a correctly-detected Telugu, code-mixed
+    query answered in plain English 3/3 times with the old ordering."""
     if not forced_context:
-        return user_message
+        return directive_and_message
     return (
         "[The following was already retrieved from mTouch Labs' real website content — "
-        f"use it directly to answer; do not guess or use any other name/fact]\n{forced_context}\n\n{user_message}"
+        f"use it directly to answer; do not guess or use any other name/fact]\n{forced_context}\n\n{directive_and_message}"
     )
 
 
@@ -453,8 +462,8 @@ async def stream_turn(
     directive = _turn_directive(session, user_message)
     expected_script = _expected_script(session, user_message)
     forced_context = await _forced_company_context(user_message, tools)
-    augmented_user_message = _with_forced_context(user_message, forced_context)
-    initial_message = f"{directive}\n\n{augmented_user_message}" if directive else augmented_user_message
+    directive_and_message = f"{directive}\n\n{user_message}" if directive else user_message
+    initial_message = _with_forced_context(directive_and_message, forced_context)
     messages: list[Message] = [*(history or []), {"role": "user", "content": initial_message}]
 
     known_tool_names = frozenset((tools or {}).keys())
@@ -618,8 +627,8 @@ async def run_turn(
     expected_script = _expected_script(session, user_message)
 
     forced_context = await _forced_company_context(user_message, tools)
-    augmented_user_message = _with_forced_context(user_message, forced_context)
-    initial_message = f"{directive}\n\n{augmented_user_message}" if directive else augmented_user_message
+    directive_and_message = f"{directive}\n\n{user_message}" if directive else user_message
+    initial_message = _with_forced_context(directive_and_message, forced_context)
     messages: list[Message] = [*(history or []), {"role": "user", "content": initial_message}]
     # Forced retrieval counts as a real tool-backed answer for the
     # TOOL_VERIFIED_MARKER history tag (graph.py), even though it was
