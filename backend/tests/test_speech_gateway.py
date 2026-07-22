@@ -4,10 +4,28 @@ via dependency overrides."""
 
 import json
 
+import pytest
 from fastapi.testclient import TestClient
 
 from agent_core.speech.clients import STTMode
 from agent_core.speech_gateway.main import gateway_app, get_stt_client, get_tts_client_resolver
+
+
+@pytest.fixture(autouse=True)
+def _reset_rate_limiter():
+    # Real test fragility found live: _session_rate_limiter is a single,
+    # process-global sliding window that's never reset between tests, and
+    # every test in this file connects as the same TestClient "testclient"
+    # host. As this file accumulates more WebSocket-connecting tests, later
+    # ones eventually cross the limit and get spuriously rate-limited --
+    # not a real bug, just shared state bleeding across tests. Reset before
+    # every test instead of only patching whichever test happened to tip it
+    # over first.
+    from agent_core.speech_gateway.main import _session_rate_limiter
+
+    _session_rate_limiter._hits.pop("testclient", None)
+    yield
+    _session_rate_limiter._hits.pop("testclient", None)
 
 
 class FakeGatewaySTT:
@@ -138,6 +156,55 @@ def test_tts_ws_synthesizes_the_inner_text_not_the_json_envelope():
             audio_chunks = [ws.receive_bytes(), ws.receive_bytes()]
         assert fake.synthesize_calls == ["Hello there.", "Second sentence."]
         assert audio_chunks[0] == b"AUDIO[Hello there.]"
+    finally:
+        gateway_app.dependency_overrides.clear()
+
+
+class FailOnceThenSucceedTTS:
+    """First synthesize() call fails right after CONSUMING one chunk from
+    the text iterator (but before yielding its audio) -- simulating
+    Sarvam's socket dying mid-utterance, e.g. its own idle-close while the
+    LLM was still producing that text. The second call (the retry) must
+    see the FULL original text again, not just whatever's left of an
+    already-drained generator."""
+
+    def __init__(self):
+        self.calls_text: list[list[str]] = []
+        self._call_count = 0
+
+    async def synthesize(self, text_chunks, *, language, model="bulbul:v3", voice=None, pace=None):
+        self._call_count += 1
+        seen: list[str] = []
+        self.calls_text.append(seen)
+        async for chunk in text_chunks:
+            seen.append(chunk)
+            if self._call_count == 1:
+                raise RuntimeError("simulated Sarvam socket closed mid-utterance")
+            yield f"AUDIO[{chunk}]".encode()
+
+
+def test_tts_ws_retry_replays_full_text_not_just_whatever_is_left():
+    """Real bug hit live, reproduced from an actual report: primary_attempt()
+    used to hand the SAME text_chunks iterator to every retry attempt. An
+    async generator can only be consumed once -- if the first attempt's
+    socket died after CONSUMING (not necessarily synthesizing) a chunk, the
+    retry got whatever was left of an already-drained iterator, which for a
+    short, already-fully-streamed answer was nothing at all. Logged live as
+    "zero audio chunks, no exception" on the retry. The fix buffers every
+    consumed chunk so a retry replays the full text from the start."""
+    fake = FailOnceThenSucceedTTS()
+    gateway_app.dependency_overrides[get_tts_client_resolver] = lambda: (lambda language: fake)
+    try:
+        client = TestClient(gateway_app)
+        with client.websocket_connect("/ws/tts") as ws:
+            ws.send_text(json.dumps({"language": "hi", "model": "bulbul:v3"}))
+            ws.send_text(json.dumps({"text": "Hello there."}))
+            ws.send_text(json.dumps({"text": "__END__"}))
+            audio_chunk = ws.receive_bytes()
+        assert audio_chunk == b"AUDIO[Hello there.]"
+        # The retry (2nd call) saw the full text again -- not an empty,
+        # already-drained iterator.
+        assert fake.calls_text[1] == ["Hello there."]
     finally:
         gateway_app.dependency_overrides.clear()
 

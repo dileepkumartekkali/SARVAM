@@ -323,12 +323,34 @@ async def tts_ws(websocket: WebSocket, tts_client_resolver=Depends(get_tts_clien
                 return
             yield text
 
-    text_gen = chunk_stream(client_text_deltas())
+    _text_gen = chunk_stream(client_text_deltas())
+    _sent_chunks: list[str] = []
+
+    async def _replay_then_continue():
+        # Real bug hit live, reproduced from a real report: primary_attempt()
+        # used to hand the SAME _text_gen iterator to every retry attempt.
+        # An async generator can only be consumed once -- if the first
+        # attempt's socket died after sending one chunk (observed: Sarvam
+        # closed the connection normally, code 1000, after ~5s of the TTS
+        # socket sitting idle waiting for text while the LLM was still
+        # generating it -- the socket is opened early, before any text
+        # exists, for latency), the retry got whatever was LEFT of an
+        # already-drained iterator -- for a short, one-sentence answer
+        # that had already fully streamed by then, that was nothing at
+        # all. Exactly matches the logged "zero audio chunks, no
+        # exception" failure. Buffers every chunk as it's consumed so a
+        # retry replays the FULL text from the start, then continues with
+        # anything new, instead of silently sending less than before.
+        for chunk in _sent_chunks:
+            yield chunk
+        async for chunk in _text_gen:
+            _sent_chunks.append(chunk)
+            yield chunk
 
     def primary_attempt():
         # One synthesize() call = one socket, reused for every chunk the
         # chunker yields — never opened per chunk (S2S plan §2-3).
-        return tts_client.synthesize(text_gen, language=language, model=model, voice=voice, pace=pace)
+        return tts_client.synthesize(_replay_then_continue(), language=language, model=model, voice=voice, pace=pace)
 
     async def on_text_only_fallback():
         errors_total.labels(stage="tts").inc()
