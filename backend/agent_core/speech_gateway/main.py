@@ -271,7 +271,13 @@ async def tts_ws(websocket: WebSocket, tts_client_resolver=Depends(get_tts_clien
     try:
         config = json.loads(await websocket.receive_text())
         language = config["language"]
-        model = config.get("model", "bulbul:v3")
+        # Real bug hit live: this account's real Sarvam API doesn't honor
+        # "bulbul:v3" -- confirmed directly against the live API, every
+        # v3-only speaker gets rejected as incompatible with bulbul:v2
+        # regardless of the "model" value sent, while v2's own speakers
+        # succeed. The frontend also sends this explicitly (see
+        # useVoiceSession.js) -- fixed there too, this is just the fallback.
+        model = config.get("model", "bulbul:v2")
         voice = config.get("voice")
         pace = config.get("pace")
     except (WebSocketDisconnect, json.JSONDecodeError, KeyError):

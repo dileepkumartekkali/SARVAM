@@ -53,10 +53,10 @@ _PACE_RANGES = {"bulbul:v2": (0.3, 3.0), "bulbul:v3": (0.5, 2.0)}
 # reported. Requesting uncompressed linear16 PCM instead means every chunk
 # decodes cleanly and independently, matching how it's actually played.
 _OUTPUT_AUDIO_CODEC = "linear16"
-# bulbul:v3's own documented default sample rate (24000 Hz) -- NOT the
-# 22050 Hz bulbul:v2 defaults to, which frontend/src/api/ttsPlayback.js's
-# fallback PCM decoder was hardcoded to (a guess that was never actually
-# verified against Sarvam's real API, per that file's own docstring).
+# 24000 Hz -- confirmed live to actually work with this account's real
+# bulbul:v2 usage (a real synthesize() call returned real audio bytes at
+# this rate), not the 22050 Hz frontend/src/api/ttsPlayback.js's fallback
+# PCM decoder used to guess (never verified against a real payload).
 # Requested explicitly so both sides agree on a known rate instead of each
 # independently guessing.
 _SPEECH_SAMPLE_RATE = 24000
@@ -69,18 +69,19 @@ _LANGUAGE_TO_SARVAM_CODE = {
     "en": "en-IN",
 }
 
-# Real bug hit live, reported as "English is clear, Telugu is not": the old
-# single flat default ("anushka") is a bulbul:v2-ONLY speaker (confirmed
-# against Sarvam's real docs) -- but every live call in this app defaults to
-# model="bulbul:v3", whose speaker list doesn't include "anushka" at all.
-# Docs are explicit: "speaker selection must match the chosen model
-# version... no cross-model speaker usage." Every TTS call here has been
-# sending an invalid speaker/model pair, likely triggering some
-# undocumented fallback on Sarvam's side whose quality apparently isn't
-# consistent across languages. Made model-aware (matching this file's own
-# _PACE_RANGES pattern) rather than just picking a new flat default and
-# silently reintroducing the identical bug for bulbul:v2 -- that model has
-# no live call site today, but it IS a supported, tested path in this file.
+# Real bug hit live, reported as "English is clear, Telugu is not,
+# and now no audio at all": this app assumed model="bulbul:v3" as the
+# default everywhere, with "shubh" as its speaker (bulbul:v3's own
+# documented default). Confirmed DIRECTLY against the live API with this
+# account's real key: every v3-only speaker (shubh, priya, aditya, ...) is
+# rejected as "not compatible with model bulbul:v2" regardless of what
+# "model" value is sent -- this account's real Sarvam API does not honor
+# bulbul:v3 at all, it always evaluates as v2. "anushka" (a real v2
+# speaker) succeeded in that same direct test. The actual default model is
+# now "bulbul:v2" (see synthesize()'s own default, and every call site) --
+# kept model-aware here (matching this file's own _PACE_RANGES pattern)
+# so bulbul:v3 stays a supported, correct path if this account's access
+# ever changes, without being the (currently broken) default.
 _DEFAULT_SPEAKERS = {"bulbul:v2": "anushka", "bulbul:v3": "shubh"}
 
 
@@ -147,7 +148,7 @@ class SarvamTTSClient:
         text_chunks: AsyncIterator[str],
         *,
         language: str,
-        model: str = "bulbul:v3",
+        model: str = "bulbul:v2",
         voice: str | None = None,
         pace: float | None = None,
     ) -> AsyncIterator[bytes]:

@@ -86,7 +86,13 @@ class SpeechTTSClient(Protocol):
         text_chunks: AsyncIterator[str],
         *,
         language: str,
-        model: str = "bulbul:v3",   # v2 uses pitch/loudness; v3 uses temperature — model-aware config
+        # Real bug hit live: this account's real Sarvam API doesn't honor
+        # "bulbul:v3" at all -- confirmed directly, every v3-only speaker
+        # gets rejected as "not compatible with model bulbul:v2" regardless
+        # of what "model" value is sent, while v2's own speakers succeed.
+        # v2 uses pitch/loudness; v3 (unavailable on this account) would use
+        # temperature instead -- model-aware config either way.
+        model: str = "bulbul:v2",
         voice: str | None = None,
         pace: float | None = None,
     ) -> AsyncIterator[bytes]:

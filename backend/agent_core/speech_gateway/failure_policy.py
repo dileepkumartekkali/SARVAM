@@ -20,9 +20,12 @@ row of the matrix is a distinct decision:
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import AsyncIterator, Awaitable, Callable
 
 from ..agents.task_agent import CLARIFYING_QUESTION, LLM_UNAVAILABLE_APOLOGY
+
+logger = logging.getLogger("agent_core.speech_gateway")
 
 TRANSCRIPT_CONFIDENCE_THRESHOLD = 0.4
 
@@ -110,7 +113,12 @@ async def tts_synthesize_with_retry_then_fallback(
             async for chunk in primary_attempt():
                 yield chunk
             return
-        except Exception:
+        except Exception as e:  # noqa: BLE001 -- real gap: this was swallowed
+            # with NO logging at all, on either attempt -- the actual Sarvam
+            # error (a config rejection, an auth failure, anything) was
+            # completely unrecoverable after the fact, forcing pure
+            # guesswork to debug a live "no audio" report.
+            logger.exception("TTS synthesis failed (attempt %d/2): %s", attempt + 1, e)
             if attempt == 1:
                 await on_text_only_fallback()
                 return

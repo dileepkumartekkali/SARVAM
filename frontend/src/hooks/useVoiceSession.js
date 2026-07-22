@@ -168,7 +168,13 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
           }
         },
       });
-      const ws = socket.connectTTS({ language: ttsLanguage, model: "bulbul:v3" });
+      // Real bug hit live: this account's real Sarvam API doesn't honor
+      // "bulbul:v3" at all -- confirmed directly against the live API,
+      // every v3-only speaker gets rejected as incompatible with bulbul:v2
+      // regardless of the model value sent, while v2's own speakers
+      // succeed cleanly. Backend defaults now match (agent_core/speech/
+      // sarvam_tts.py, speech_gateway/main.py).
+      const ws = socket.connectTTS({ language: ttsLanguage, model: "bulbul:v2" });
       const opened = withTimeout(
         new Promise((resolve) => ws.addEventListener("open", resolve)),
         TTS_OPEN_TIMEOUT_MS
