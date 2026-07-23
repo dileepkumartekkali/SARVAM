@@ -74,7 +74,19 @@ async def embed_text(
     headers = {"Authorization": f"Bearer {_api_token()}"}
 
     async with httpx.AsyncClient(timeout=timeout, transport=transport) as client:
-        resp = await client.post(url, json={"inputs": text}, headers=headers)
+        try:
+            resp = await client.post(url, json={"inputs": text}, headers=headers)
+        except httpx.TimeoutException as e:
+            # Real gap: a network-level timeout (as opposed to a 503/429
+            # HTTP response) raised httpx's own exception type, which
+            # nothing downstream (_embed_with_retry's retry loop,
+            # search_company_knowledge's error handling) was ever built to
+            # catch -- both only look for EmbeddingError. Confirmed live: a
+            # cold HF serverless model start took 24-54s and raised
+            # httpx.ReadTimeout uncaught. Normalizing it here means a slow
+            # cold start is retried/reported exactly like any other
+            # transient failure instead of crashing whatever called this.
+            raise EmbeddingError(f"HF embedding request timed out: {e}", retriable=True) from e
         if resp.status_code != 200:
             # 503 means the model is "loading" on HF's serverless
             # infrastructure -- a transient cold-start. 429 is the free

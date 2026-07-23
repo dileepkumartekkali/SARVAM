@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -26,6 +27,7 @@ from ..observability.logging_config import configure_logging
 from ..observability.metrics import metrics_response
 from ..observability.tracing import init_tracing
 from ..persistence import chat_store
+from ..rag import embeddings
 from ..security.auth import Principal, get_current_principal
 from ..security.confirmation import ConfirmationGate
 from ..supervisor.graph import build_text_graph
@@ -44,6 +46,19 @@ async def _lifespan(_app: FastAPI):
     # free tier idles the whole process) — a real, measured chunk of the
     # "first load after refresh is slow" latency.
     await chat_store.warm_up()
+    # Same reasoning, same trade-off, for HF's serverless embedding model:
+    # confirmed live that a cold bge-m3 start alone can take 24-54s, all of
+    # it spent BEFORE the LLM even starts answering, and it happens on
+    # whichever user's message first names the company after any idle
+    # period (Render free tier idles the whole process the same way).
+    # Best-effort only — if HF is genuinely down, the live call will still
+    # time out fast (rag_tool._LIVE_EMBED_TIMEOUT_SECONDS) and degrade
+    # gracefully rather than hang, so a failed warm-up isn't fatal here.
+    if rag_is_available():
+        try:
+            await embeddings.embed_text("warm up", timeout=45.0)
+        except Exception:
+            logging.getLogger("agent_core.api").warning("HF embedding warm-up failed", exc_info=True)
     yield
 
 

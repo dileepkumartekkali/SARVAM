@@ -80,6 +80,25 @@ async def test_503_and_429_are_retriable_other_errors_are_not(monkeypatch):
     assert exc_info.value.retriable is False
 
 
+async def test_network_timeout_is_wrapped_as_retriable_embedding_error(monkeypatch):
+    """Real bug hit live: a cold HF serverless model start (bge-m3 unloads
+    after idling, same as this whole process on Render's free tier) raised
+    a raw httpx.ReadTimeout that nothing downstream was built to catch --
+    both _embed_with_retry's retry loop and search_company_knowledge's
+    error handling only look for EmbeddingError. Confirmed live: a cold
+    call took 24-54s and the exception leaked straight past both."""
+    monkeypatch.setenv("HF_API_TOKEN", "test-token")
+
+    def _timeout(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("simulated cold start", request=request)
+
+    transport = httpx.MockTransport(_timeout)
+
+    with pytest.raises(embeddings.EmbeddingError) as exc_info:
+        await embeddings.embed_text("hello", transport=transport)
+    assert exc_info.value.retriable is True
+
+
 def test_is_configured_reflects_env_var(monkeypatch):
     monkeypatch.delenv("HF_API_TOKEN", raising=False)
     assert embeddings.is_configured() is False

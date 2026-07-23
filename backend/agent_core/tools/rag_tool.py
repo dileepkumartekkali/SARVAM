@@ -26,6 +26,19 @@ from .registry import ToolSpec
 _MAX_EMBED_ATTEMPTS = 2
 _RETRY_DELAY_SECONDS = 0.5
 
+# Real bug hit live: embed_text's own 30s default timeout is sized for the
+# ingestion script (one-off, offline, fine to wait out a cold HF serverless
+# model). On a LIVE turn that same 30s timeout, doubled by the retry above,
+# let a single cold-start eat up to ~60s of wall-clock time BEFORE the LLM
+# even starts answering -- measured directly: a real cold call took 24-54s
+# end to end. That cascades into two more symptoms downstream: the TTS
+# gateway's own idle-close fires long before text ever arrives (no audio),
+# and forced retrieval silently gives up (see _forced_company_context's
+# except-and-return-None), so the model answers from unverified memory
+# instead -- the exact hallucination this tool exists to prevent. A live
+# turn should fail fast and answer without RAG context rather than hang.
+_LIVE_EMBED_TIMEOUT_SECONDS = 8.0
+
 # 8, not the original 4 -- live testing against the real ingested chunks
 # showed a genuinely relevant page (Leadership Team, for "who is the CEO")
 # ranked 5th, just outside the old cutoff. The knowledge base is only ~111
@@ -58,7 +71,7 @@ async def _embed_with_retry(query: str) -> list[float]:
     last_error: embeddings.EmbeddingError | None = None
     for attempt in range(_MAX_EMBED_ATTEMPTS):
         try:
-            return await embeddings.embed_text(query)
+            return await embeddings.embed_text(query, timeout=_LIVE_EMBED_TIMEOUT_SECONDS)
         except embeddings.EmbeddingError as e:
             last_error = e
             if not e.retriable or attempt == _MAX_EMBED_ATTEMPTS - 1:
