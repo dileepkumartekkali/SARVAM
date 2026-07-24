@@ -204,7 +204,20 @@ class GeminiProvider:
                         retriable=_gemini_retriable(resp.status_code),
                         provider=self.name,
                     )
-                parts = resp.json()["candidates"][0]["content"]["parts"]
+                candidates = resp.json().get("candidates") or []
+                # A real shape Gemini's API can return on a 200: an empty
+                # candidates list, or a candidate blocked by safety/recitation
+                # filtering with no "content"/"parts" at all. Direct indexing
+                # here would raise a bare IndexError/KeyError instead of a
+                # retriable LLMProviderError, escaping the router's fallback.
+                if not candidates or "content" not in candidates[0] or "parts" not in candidates[0]["content"]:
+                    raise LLMProviderError(
+                        f"{self.name} returned no usable content (finishReason="
+                        f"{candidates[0].get('finishReason') if candidates else 'NO_CANDIDATES'})",
+                        retriable=True,
+                        provider=self.name,
+                    )
+                parts = candidates[0]["content"]["parts"]
         except httpx.TimeoutException as e:
             raise LLMProviderError(f"{self.name} timeout: {e}", retriable=True, provider=self.name) from e
         except httpx.TransportError as e:

@@ -97,13 +97,22 @@ def decode_token(token: str, config: AuthConfig | None = None) -> Principal:
                 issuer=cfg.issuer,
                 options={"require": ["exp", "sub"], "verify_aud": cfg.audience is not None},
             )
-    except (RuntimeError, jwt.PyJWKClientError) as e:
+    except (RuntimeError, jwt.PyJWKClientConnectionError) as e:
         # A missing secret/unreachable JWKS endpoint is a server
         # misconfiguration, not a client auth failure — a real bug hit in
         # production once already for the missing-secret case (bare
         # RuntimeError, uncaught, every authenticated request 500'd with no
         # diagnosable message), so both stay a clean 500 with a real reason.
         raise AuthError(f"server misconfigured: {e}", status_code=status.HTTP_500_INTERNAL_SERVER_ERROR) from e
+    except jwt.PyJWKClientError as e:
+        # Real gap: this used to be lumped in with the server-misconfig
+        # case above. A token whose `kid` isn't in the provider's JWKS
+        # (unknown/forged, entirely client-controlled) raises this same
+        # base PyJWKClientError, distinct from PyJWKClientConnectionError
+        # (network/fetch failure, genuinely server-side) -- a bad token was
+        # misclassified as a 500 server error instead of a 401, polluting
+        # server-error alerting for what is just a rejected auth attempt.
+        raise AuthError(f"invalid token: {e}") from e
     except jwt.ExpiredSignatureError as e:
         raise AuthError("token expired") from e
     except jwt.InvalidTokenError as e:

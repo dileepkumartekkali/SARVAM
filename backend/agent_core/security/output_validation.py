@@ -63,6 +63,61 @@ def strip_tool_verified_marker(text: str) -> str:
 _MARKER_LEN = len(TOOL_VERIFIED_MARKER)
 
 
+_LEAK_MARKER_MAX_LEN = max(len(m) for m in _SYSTEM_PROMPT_LEAK_MARKERS)
+
+
+def stream_safe_sanitize(buffered: str) -> tuple[str, str, bool]:
+    """Real gap hit live: `stream_turn` only ever ran `marker_safe_split`
+    (TOOL_VERIFIED_MARKER only) on live `text_delta` chunks -- the
+    system-prompt-leak refusal and script/HTML stripping in
+    `sanitize_llm_output` only ran on the terminal `done` event, whose text
+    is DISCARDED on the success path (the frontend already rendered the raw
+    deltas). A prompt-injected/malfunctioning model emitting the system
+    prompt or a `<script>` payload reached the client verbatim through live
+    deltas -- the leak-refusal and script/HTML defenses were fully inert on
+    the primary streaming path.
+
+    Same holdback philosophy as `marker_safe_split`, generalized:
+    - TOOL_VERIFIED_MARKER and the leak markers are fixed-length strings --
+      hold back enough of the tail that a partial occurrence forming right
+      at the boundary can never be released prematurely, exactly like
+      `marker_safe_split` already does for the one marker.
+    - HTML/script tags have no fixed length, so instead of a length-based
+      holdback, anything from an unclosed trailing `<` onward is held back
+      until its matching `>` arrives (a `<script>` block of any length is
+      still fully removed once closed -- it just isn't released piecemeal
+      while open).
+
+    Returns (safe_to_yield, new_tail_to_keep_buffering, leak_detected).
+    Once a full system-prompt-leak marker is found, `leak_detected` is True
+    and `safe_to_yield` is the leak refusal -- the caller must stop
+    streaming any further real content for this turn (already-yielded
+    chunks before detection can't be recalled over SSE; this stops the
+    rest of the leak from continuing to stream, which is the same
+    trade-off streaming turns already accept elsewhere in this module for
+    self-check correction).
+    """
+    cleaned = _SCRIPT_TAG.sub("", buffered)
+    cleaned = _HTML_TAG.sub("", cleaned)
+    cleaned = _TOOL_VERIFIED_MARKER_RE.sub("", cleaned)
+
+    if any(marker in cleaned for marker in _SYSTEM_PROMPT_LEAK_MARKERS):
+        return _LEAK_REFUSAL, "", True
+
+    hold_back = _MARKER_LEN - 1
+    hold_back = max(hold_back, _LEAK_MARKER_MAX_LEN - 1)
+    last_open = cleaned.rfind("<")
+    if last_open != -1 and cleaned.find(">", last_open) == -1:
+        # An unclosed tag/script-open is forming at the tail -- hold back
+        # everything from it onward regardless of the fixed-marker amount.
+        hold_back = max(hold_back, len(cleaned) - last_open)
+
+    if len(cleaned) <= hold_back:
+        return "", cleaned, False
+    split_at = len(cleaned) - hold_back
+    return cleaned[:split_at], cleaned[split_at:], False
+
+
 def marker_safe_split(buffered: str) -> tuple[str, str]:
     """Real gap caught by this fix's OWN regression test, twice over: (1) a
     per-chunk-only strip isn't enough -- the chunker can split the marker

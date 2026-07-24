@@ -121,6 +121,14 @@ _STREAM_MAX_HISTORY_MESSAGES = 20
 # the cap gives it a bound without needing a new dependency.
 _STREAM_HISTORY_MAX_THREADS = 1000
 _stream_history: "OrderedDict[tuple[str, str], list[dict]]" = OrderedDict()
+# Real gap: the read (get history) and write (save history + turn) below
+# straddle many `await` points inside stream_turn with nothing serializing
+# them -- two concurrent /chat/stream requests for the SAME (user, thread)
+# each read the same base history, and whichever writes back last silently
+# overwrites the other's turn. A per-key lock (bounded together with
+# _stream_history's own eviction below) serializes same-thread turns without
+# affecting different threads/users, which run fully in parallel as before.
+_stream_history_locks: dict[tuple[str, str], asyncio.Lock] = {}
 # One gate for the process, not per-request — a confirmation issued on turn N
 # must still be redeemable on turn N+1 (same reasoning as build_text_graph's).
 _stream_confirmation_gate = ConfirmationGate() if _tool_registry.write_scope_names() else None
@@ -349,52 +357,55 @@ async def chat_stream(req: ChatRequest, principal: Principal = Depends(get_curre
             # (subject, thread_id) makes that impossible regardless of
             # where thread_id came from.
             history_key = (principal.subject, req.thread_id)
-            history = _stream_history.get(history_key, [])
-            if history_key in _stream_history:
-                _stream_history.move_to_end(history_key)
-            final_event = None
-            async for event in stream_turn(
-                session,
-                _router,
-                req.message,
-                tools=_tool_registry.as_dispatch_dict(),
-                tool_definitions=_tool_registry.as_tool_definitions(),
-                tool_manifest=_tool_registry.as_prompt_manifest(),
-                write_scope_tools=_tool_registry.write_scope_names(),
-                confirmation_gate=_stream_confirmation_gate,
-                confirmation_token=req.confirmation_token,
-                history=history,
-            ):
-                if event["type"] == "text_delta":
-                    yield _sse_event(event)
-                else:
-                    final_event = event
-            final_text = final_event["text"]
-            self_check_ok = final_event["self_check_ok"]
-            pending = final_event.get("pending_confirmation")
-            is_error = final_event.get("error", False)
-            # Clarify turns are deliberately NOT added to history, matching
-            # graph.py's clarify_node (which never touches the "history" key).
-            # A failed turn (is_error) isn't added either — there's nothing
-            # real for the agent to remember, and it shouldn't bias the next
-            # turn's context with an apology that wasn't really an answer.
-            if not is_error:
-                # Marker appended ONLY in what the LLM sees back as its own
-                # history next turn -- never in `final_text` (already shown/
-                # spoken/persisted above, unmarked). See rag_tool.py's
-                # TOOL_VERIFIED_MARKER: without this, a wrong answer from a
-                # turn that skipped the tool got repeated verbatim on a
-                # later question in the same conversation, since history had
-                # no way to distinguish "checked" from "guessed."
-                history_text = final_text
-                if final_event.get("tool_call_count", 0) > 0:
-                    history_text = f"{final_text}\n{TOOL_VERIFIED_MARKER}"
-                _stream_history[history_key] = (
-                    history + [{"role": "user", "content": req.message}, {"role": "assistant", "content": history_text}]
-                )[-_STREAM_MAX_HISTORY_MESSAGES:]
-                _stream_history.move_to_end(history_key)
-                if len(_stream_history) > _STREAM_HISTORY_MAX_THREADS:
-                    _stream_history.popitem(last=False)
+            history_lock = _stream_history_locks.setdefault(history_key, asyncio.Lock())
+            async with history_lock:
+                history = _stream_history.get(history_key, [])
+                if history_key in _stream_history:
+                    _stream_history.move_to_end(history_key)
+                final_event = None
+                async for event in stream_turn(
+                    session,
+                    _router,
+                    req.message,
+                    tools=_tool_registry.as_dispatch_dict(),
+                    tool_definitions=_tool_registry.as_tool_definitions(),
+                    tool_manifest=_tool_registry.as_prompt_manifest(),
+                    write_scope_tools=_tool_registry.write_scope_names(),
+                    confirmation_gate=_stream_confirmation_gate,
+                    confirmation_token=req.confirmation_token,
+                    history=history,
+                ):
+                    if event["type"] == "text_delta":
+                        yield _sse_event(event)
+                    else:
+                        final_event = event
+                final_text = final_event["text"]
+                self_check_ok = final_event["self_check_ok"]
+                pending = final_event.get("pending_confirmation")
+                is_error = final_event.get("error", False)
+                # Clarify turns are deliberately NOT added to history, matching
+                # graph.py's clarify_node (which never touches the "history" key).
+                # A failed turn (is_error) isn't added either — there's nothing
+                # real for the agent to remember, and it shouldn't bias the next
+                # turn's context with an apology that wasn't really an answer.
+                if not is_error:
+                    # Marker appended ONLY in what the LLM sees back as its own
+                    # history next turn -- never in `final_text` (already shown/
+                    # spoken/persisted above, unmarked). See rag_tool.py's
+                    # TOOL_VERIFIED_MARKER: without this, a wrong answer from a
+                    # turn that skipped the tool got repeated verbatim on a
+                    # later question in the same conversation, since history had
+                    # no way to distinguish "checked" from "guessed."
+                    history_text = final_text
+                    if final_event.get("tool_call_count", 0) > 0:
+                        history_text = f"{final_text}\n{TOOL_VERIFIED_MARKER}"
+                    _stream_history[history_key] = (
+                        history + [{"role": "user", "content": req.message}, {"role": "assistant", "content": history_text}]
+                    )[-_STREAM_MAX_HISTORY_MESSAGES:]
+                    _stream_history.move_to_end(history_key)
+                    if len(_stream_history) > _STREAM_HISTORY_MAX_THREADS:
+                        evicted_key, _ = _stream_history.popitem(last=False)
+                        _stream_history_locks.pop(evicted_key, None)
 
         # A failed turn (is_error) is shown to the user but never persisted —
         # it's not a real answer, so it shouldn't clutter their saved history.

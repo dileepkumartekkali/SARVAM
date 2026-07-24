@@ -222,7 +222,17 @@ class OpenAICompatibleProvider:
                         retriable=status_retriable(resp.status_code),
                         provider=self.name,
                     )
-                choice = resp.json()["choices"][0]
+                choices = resp.json().get("choices") or []
+                if not choices:
+                    # Same empty-choices shape stream() above already guards
+                    # against (a real one hit live against Sarvam) -- this
+                    # non-streaming path had no equivalent guard, so it would
+                    # crash with a raw IndexError instead of a retriable
+                    # LLMProviderError, escaping the router's fallback chain.
+                    raise LLMProviderError(
+                        f"{self.name} returned a 200 with no choices", retriable=True, provider=self.name
+                    )
+                choice = choices[0]
                 message = choice["message"]
         except httpx.TimeoutException as e:
             raise LLMProviderError(f"{self.name} timeout: {e}", retriable=True, provider=self.name) from e
@@ -244,8 +254,22 @@ class OpenAICompatibleProvider:
                 provider=self.name,
             )
 
-        tool_calls = [
-            ToolCall(id=tc["id"], name=tc["function"]["name"], args=json.loads(tc["function"]["arguments"]))
-            for tc in message.get("tool_calls") or []
-        ]
+        tool_calls = []
+        for tc in message.get("tool_calls") or []:
+            try:
+                # A real gap: malformed/empty tool-call arguments (a
+                # provider returning "" for a zero-argument call, or
+                # otherwise-invalid JSON) raised a bare json.JSONDecodeError
+                # here -- not an LLMProviderError, so nothing downstream
+                # (the router's fallback loop, task_agent's exception
+                # handling) ever caught it. It escaped as an uncaught 500
+                # with no fallback attempted, defeating the one error type
+                # this whole adapter layer exists to normalize to (see
+                # base.py's own module docstring).
+                args = json.loads(tc["function"]["arguments"] or "{}")
+            except json.JSONDecodeError as e:
+                raise LLMProviderError(
+                    f"{self.name} returned malformed tool-call arguments: {e}", retriable=False, provider=self.name
+                ) from e
+            tool_calls.append(ToolCall(id=tc["id"], name=tc["function"]["name"], args=args))
         return CompletionResult(text=message.get("content") or "", tool_calls=tool_calls)

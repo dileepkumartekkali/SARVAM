@@ -126,7 +126,12 @@ def test_unreachable_jwks_is_a_clean_500(monkeypatch):
     import agent_core.security.auth as auth_module
 
     def _raise(_url):
-        raise jwt.PyJWKClientError("could not fetch JWKS")
+        # The real PyJWKClient raises this specific subclass for a network/
+        # fetch failure, distinct from the plain PyJWKClientError raised for
+        # an unknown `kid` (see test_unknown_kid_is_a_401_not_a_500) --
+        # using the real type here so this test still exercises the actual
+        # "genuinely unreachable" path, not the client-error one.
+        raise jwt.PyJWKClientConnectionError("could not fetch JWKS")
 
     auth_module._jwks_client.cache_clear()
     monkeypatch.setattr(auth_module, "_jwks_client", _raise)
@@ -135,3 +140,27 @@ def test_unreachable_jwks_is_a_clean_500(monkeypatch):
         decode_token(_make_token())
 
     assert exc_info.value.status_code == 500
+
+
+def test_unknown_kid_is_a_401_not_a_500(monkeypatch):
+    """Real bug hit live: a token whose `kid` isn't in the provider's JWKS
+    (unknown/forged -- entirely client-controlled, not a server problem)
+    raised the same base PyJWKClientError as a genuinely unreachable JWKS
+    endpoint, both mapped to a 500 -- polluting server-error alerting for
+    what is just a rejected auth attempt. The token is still rejected
+    either way; only the status code (and thus what monitoring learns from
+    it) was wrong."""
+    monkeypatch.setenv("SUPABASE_URL", "https://fake-project.supabase.co")
+
+    import agent_core.security.auth as auth_module
+
+    def _raise(_url):
+        raise jwt.PyJWKClientError('Unable to find a signing key that matches: "unknown-kid"')
+
+    auth_module._jwks_client.cache_clear()
+    monkeypatch.setattr(auth_module, "_jwks_client", _raise)
+
+    with pytest.raises(AuthError) as exc_info:
+        decode_token(_make_token())
+
+    assert exc_info.value.status_code == 401

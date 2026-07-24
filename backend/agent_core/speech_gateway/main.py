@@ -452,7 +452,18 @@ async def converse_ws(
 
     async def client_audio():
         while True:
-            message = await websocket.receive()
+            try:
+                # Same dead-client leak class fixed in stt_ws/tts_ws (see
+                # their own comments): a live mic sends a frame every 32ms,
+                # so a long gap with nothing at all means the client died
+                # without a clean close frame. Without this, `receive()`
+                # blocked forever, `stt_pump` never ended, and the
+                # orchestrator loop below blocked on `event_queue.get()`
+                # permanently -- the connection and the upstream Sarvam STT
+                # stream leaked for the process lifetime.
+                message = await asyncio.wait_for(websocket.receive(), timeout=_CLIENT_IDLE_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                return
             if message["type"] == "websocket.disconnect":
                 return
             frame = message.get("bytes")
@@ -577,11 +588,27 @@ async def converse_ws(
             # re-entry into the same phase once the task does run.
             duplex.state.transition_to(SessionPhase.THINKING)
             turn_task = asyncio.ensure_future(run_turn(event["text"]))
+            # Real gap this fix's own phase flip (above) introduced: a
+            # barge-in landing before run_turn's body reaches
+            # start_thinking()/start_speaking() (or in the brief gap between
+            # them, e.g. while `assistant_text` is being sent) saw
+            # phase=THINKING and reported barge_in_detected, but had nothing
+            # registered yet to actually cancel. Registering the outer task
+            # here, in the same statement as the phase flip, closes that gap
+            # completely -- see DuplexSession._turn_task's own comment.
+            duplex.register_turn_task(turn_task)
     except WebSocketDisconnect:
         pass
     finally:
-        stt_task.cancel()
-        if turn_task is not None and not turn_task.done():
-            turn_task.cancel()
+        # Real gap: these were cancelled but never awaited before closing
+        # the socket -- the cancelled tasks only actually finalize on a
+        # later loop tick, so `stt_pump` could still be mid-`receive()`/
+        # `event_queue.put()` while the socket was already being torn down
+        # (asyncio logs "Task was destroyed but it is pending" for exactly
+        # this). Reusing DuplexSession's own cancel-and-await helper (same
+        # cancel+swallow semantics already used for barge-in) instead of a
+        # bare `.cancel()`.
+        await DuplexSession._cancel_and_await(stt_task)
+        await DuplexSession._cancel_and_await(turn_task)
         active_websocket_connections.labels(kind="converse").dec()
         await _safe_close(websocket)

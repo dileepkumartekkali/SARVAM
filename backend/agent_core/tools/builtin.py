@@ -37,6 +37,7 @@ _ALLOWED_BINOPS = {
     ast.Pow: operator.pow,
 }
 _ALLOWED_UNARYOPS = {ast.UAdd: operator.pos, ast.USub: operator.neg}
+_MAX_EXPONENT = 1000  # generous for any real query, small enough to stay instant
 
 
 def _safe_eval(node: ast.AST) -> float:
@@ -47,7 +48,16 @@ def _safe_eval(node: ast.AST) -> float:
     if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
         return node.value
     if isinstance(node, ast.BinOp) and type(node.op) in _ALLOWED_BINOPS:
-        return _ALLOWED_BINOPS[type(node.op)](_safe_eval(node.left), _safe_eval(node.right))
+        left, right = _safe_eval(node.left), _safe_eval(node.right)
+        if isinstance(node.op, ast.Pow) and abs(right) > _MAX_EXPONENT:
+            # Real gap: unbounded ** let a single crafted expression (e.g.
+            # "9**9**9") trigger a synchronous bignum computation big enough
+            # to consume enormous CPU/memory. `calculate` is an async def
+            # doing this work with no thread offload, so it blocks the
+            # entire event loop -- every concurrent request stalls until it
+            # finishes or the process OOMs.
+            raise ValueError(f"exponent too large (limit is {_MAX_EXPONENT})")
+        return _ALLOWED_BINOPS[type(node.op)](left, right)
     if isinstance(node, ast.UnaryOp) and type(node.op) in _ALLOWED_UNARYOPS:
         return _ALLOWED_UNARYOPS[type(node.op)](_safe_eval(node.operand))
     raise ValueError("expression contains a disallowed construct")

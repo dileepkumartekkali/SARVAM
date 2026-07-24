@@ -31,6 +31,14 @@ class TextGraphState(TypedDict, total=False):
     tool_call_count: int
     self_check_ok: bool
     pending_confirmation: PendingConfirmation | None
+    # Real bug hit live: task_agent_node returns "error" (line 142 below) but
+    # this key was never declared here -- LangGraph silently discards writes
+    # to channels not in this TypedDict (confirmed against the installed
+    # langgraph==1.2.9 source), so `state.get("error")` in api/main.py's
+    # /chat endpoint always saw the default False. A provider-failure apology
+    # was persisted to chat_store as a real answer and reported to the
+    # client as a success.
+    error: bool
     # Prior turns of this conversation (plain user/assistant text), persisted
     # per thread_id by the checkpointer and fed back into task_agent — this is
     # what makes the agent stateful across turns instead of a stateless

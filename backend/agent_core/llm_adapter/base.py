@@ -187,7 +187,13 @@ class LLMRouter:
                     last_error = e
                     continue
             errors_total.labels(stage="llm").inc()
-            assert last_error is not None, "LLMRouter has no providers configured"
+            if last_error is None:
+                # An empty provider list (e.g. LLM_PROVIDER_ORDER="" misconfigured)
+                # meant this loop never ran, so `assert` fired an AssertionError --
+                # stripped entirely under `python -O`, and not the one LLMProviderError
+                # type every caller in this codebase is built to catch. Same
+                # "no providers configured" case, just raised as the real contract.
+                raise LLMProviderError("LLMRouter has no providers configured", retriable=False)
             raise last_error
 
     async def complete_with_tools_and_fallback(
@@ -218,7 +224,13 @@ class LLMRouter:
                     last_error = e
                     continue
             errors_total.labels(stage="llm").inc()
-            assert last_error is not None, "LLMRouter has no providers configured"
+            if last_error is None:
+                # An empty provider list (e.g. LLM_PROVIDER_ORDER="" misconfigured)
+                # meant this loop never ran, so `assert` fired an AssertionError --
+                # stripped entirely under `python -O`, and not the one LLMProviderError
+                # type every caller in this codebase is built to catch. Same
+                # "no providers configured" case, just raised as the real contract.
+                raise LLMProviderError("LLMRouter has no providers configured", retriable=False)
             raise last_error
 
     async def stream_with_fallback(
@@ -258,5 +270,11 @@ class LLMRouter:
                     last_error = e
                     continue
             errors_total.labels(stage="llm").inc()
-            assert last_error is not None, "LLMRouter has no providers configured"
+            if last_error is None:
+                # An empty provider list (e.g. LLM_PROVIDER_ORDER="" misconfigured)
+                # meant this loop never ran, so `assert` fired an AssertionError --
+                # stripped entirely under `python -O`, and not the one LLMProviderError
+                # type every caller in this codebase is built to catch. Same
+                # "no providers configured" case, just raised as the real contract.
+                raise LLMProviderError("LLMRouter has no providers configured", retriable=False)
             raise last_error

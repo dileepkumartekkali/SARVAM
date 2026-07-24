@@ -36,6 +36,20 @@ def is_configured() -> bool:
     return bool(os.environ.get("POSTGRES_DSN"))
 
 
+def _client_supplied_uuid(value: str) -> uuid.UUID | None:
+    """`conversation_id` (unlike `user_id`, which is always the server-
+    verified Supabase subject) is client-supplied and never validated as a
+    real UUID before reaching here. Real gap: `uuid.UUID(conversation_id)`
+    raised a bare `ValueError` on anything malformed, uncaught anywhere on
+    the path -- a 500 instead of the 404 these endpoints are clearly built
+    to return for "doesn't exist or isn't yours". Returns `None` on a
+    malformed id so callers can treat it exactly like "not found"."""
+    try:
+        return uuid.UUID(value)
+    except ValueError:
+        return None
+
+
 async def _get_pool() -> asyncpg.Pool | None:
     global _pool, _pool_dsn
     dsn = os.environ.get("POSTGRES_DSN")
@@ -63,13 +77,16 @@ async def delete_conversation(conversation_id: str, user_id: str) -> bool:
     (schema: `on delete cascade`), no separate cleanup needed. Returns
     whether a row was actually deleted (false = didn't exist or wasn't
     yours; the caller reports both as 404, never which)."""
+    conv_uuid = _client_supplied_uuid(conversation_id)
+    if conv_uuid is None:
+        return False
     pool = await _get_pool()
     if pool is None:
         return False
     async with pool.acquire() as conn:
         result = await conn.execute(
             "delete from conversations where id = $1 and user_id = $2",
-            uuid.UUID(conversation_id),
+            conv_uuid,
             uuid.UUID(user_id),
         )
         return result == "DELETE 1"
@@ -110,13 +127,16 @@ async def get_conversation(conversation_id: str, user_id: str) -> dict | None:
     """Ownership check — `None` means "doesn't exist or isn't yours," both
     correctly surfaced as a 404 by the caller (never leaks which). Returns
     `None` (no-op, not an error) when persistence isn't configured."""
+    conv_uuid = _client_supplied_uuid(conversation_id)
+    if conv_uuid is None:
+        return None
     pool = await _get_pool()
     if pool is None:
         return None
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             "select id from conversations where id = $1 and user_id = $2",
-            uuid.UUID(conversation_id),
+            conv_uuid,
             uuid.UUID(user_id),
         )
         return dict(row) if row is not None else None
@@ -229,6 +249,9 @@ async def record_turn(
 
 async def list_messages(conversation_id: str, user_id: str) -> list[dict]:
     """Returns `[]` (no-op) when persistence isn't configured."""
+    conv_uuid = _client_supplied_uuid(conversation_id)
+    if conv_uuid is None:
+        return []
     pool = await _get_pool()
     if pool is None:
         return []
@@ -237,7 +260,7 @@ async def list_messages(conversation_id: str, user_id: str) -> list[dict]:
             """select id, role, content, audio_path, response_language, created_at
                from messages where conversation_id = $1 and user_id = $2
                order by created_at""",
-            uuid.UUID(conversation_id),
+            conv_uuid,
             uuid.UUID(user_id),
         )
         return [dict(r) for r in rows]

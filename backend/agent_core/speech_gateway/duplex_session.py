@@ -28,6 +28,29 @@ class DuplexSession:
         self.events: list[dict] = []
         self._task_agent_task: asyncio.Task | None = None
         self._tts_task: asyncio.Task | None = None
+        # Real bug hit live: main.py flips the phase to THINKING
+        # synchronously, at the exact moment the whole-turn task is created
+        # (closing a DIFFERENT race -- see that call site's own comment), but
+        # `_task_agent_task`/`_tts_task` above are only set once run_turn's
+        # own body actually executes far enough to reach start_thinking()/
+        # start_speaking(). A barge-in landing in that gap (or in the gap
+        # between think finishing and speak starting, e.g. while
+        # `assistant_text` is being sent) saw phase=THINKING, reported
+        # `barge_in_detected` to the client, but had nothing registered yet
+        # to actually cancel -- the assistant kept right on thinking/speaking
+        # over the user. Registering the OUTER task here, synchronously, at
+        # the same call site as the phase flip, closes that gap: cancelling
+        # it cascades into whatever it's currently awaiting (think_task,
+        # speak_task, or neither), same as asyncio always cascades a
+        # cancelled task's await chain.
+        self._turn_task: asyncio.Task | None = None
+
+    def register_turn_task(self, turn_task: asyncio.Task) -> None:
+        """Called synchronously by the caller at the exact same point it
+        flips the phase to THINKING and schedules the turn -- see this
+        class's own `_turn_task` comment for why that synchronicity matters.
+        """
+        self._turn_task = turn_task
 
     def start_thinking(self, task_agent_task: asyncio.Task) -> None:
         self.state.transition_to(SessionPhase.THINKING)
@@ -41,6 +64,7 @@ class DuplexSession:
         """Normal (non-interrupted) turn completion."""
         self._task_agent_task = None
         self._tts_task = None
+        self._turn_task = None
         self.cancellation_token = CancellationToken()
         self.state.transition_to(SessionPhase.LISTENING)
 
@@ -53,11 +77,21 @@ class DuplexSession:
             return False
 
         self.cancellation_token.cancel()
+        # Cancel the whole-turn task FIRST -- it covers the gap windows
+        # `_task_agent_task`/`_tts_task` alone can't (see `_turn_task`'s own
+        # comment). Cancelling it cascades into whatever it's currently
+        # awaiting, so by the time this returns, `_task_agent_task`/
+        # `_tts_task` (if either was ever registered) are already done —
+        # the calls below become harmless no-ops via `_cancel_and_await`'s
+        # own `task.done()` check, kept as a second layer of defense rather
+        # than removed.
+        await self._cancel_and_await(self._turn_task)
         await self._cancel_and_await(self._task_agent_task)
         await self._cancel_and_await(self._tts_task)  # closes the TTS socket via __aexit__
 
         self._task_agent_task = None
         self._tts_task = None
+        self._turn_task = None
         self.cancellation_token = CancellationToken()  # fresh token for the next turn
         self.events.append({"type": "barge_in_detected"})
         return True

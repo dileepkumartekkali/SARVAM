@@ -21,6 +21,7 @@ export class VoiceSocketClient {
     this._tts = null;
     this._reconnectAttempt = 0;
     this._closedByClient = false;
+    this._reconnectTimer = null;
   }
 
   connectSTT(config) {
@@ -37,8 +38,13 @@ export class VoiceSocketClient {
       this._onOpen();
     };
     ws.onmessage = (evt) => {
-      if (typeof evt.data === "string") {
+      if (typeof evt.data !== "string") return;
+      try {
         this._onEvent(JSON.parse(evt.data));
+      } catch {
+        // A single malformed/partial text frame shouldn't drop silently
+        // uncaught inside the WebSocket's own event dispatch -- mirrors the
+        // same hardening already done for the SSE stream in chatClient.js.
       }
     };
     ws.onclose = () => {
@@ -54,7 +60,7 @@ export class VoiceSocketClient {
     this._reconnectAttempt += 1;
     this._onReconnecting(this._reconnectAttempt);
     const delay = Math.min(250 * 2 ** (this._reconnectAttempt - 1), 4000);
-    setTimeout(() => {
+    this._reconnectTimer = setTimeout(() => {
       if (!this._closedByClient) this._openSTT(config);
     }, delay);
   }
@@ -67,6 +73,14 @@ export class VoiceSocketClient {
 
   closeSTT() {
     this._closedByClient = true;
+    // Real gap: a pending reconnect timer scheduled by a gateway-initiated
+    // close during the finalize grace window (or any mid-utterance drop)
+    // kept a live reference until it fired even after closeSTT() ran --
+    // `_openSTT`'s own `_closedByClient` check inside the timeout callback
+    // prevented it from actually reconnecting, but only after needlessly
+    // opening a throwaway socket first in some races. Clearing it here
+    // removes that race outright instead of relying on the check alone.
+    clearTimeout(this._reconnectTimer);
     this._stt?.close();
   }
 
@@ -82,7 +96,12 @@ export class VoiceSocketClient {
         // gateway's only way to say synthesis failed. Previously dropped
         // silently here, so a TTS failure looked identical to a normal
         // "utterance finished" close — no error ever reached the caller.
-        this._onEvent(JSON.parse(evt.data));
+        try {
+          this._onEvent(JSON.parse(evt.data));
+        } catch {
+          // A single malformed/partial text frame shouldn't throw
+          // uncaught inside the WebSocket's own event dispatch.
+        }
       }
     };
     this._tts = ws;

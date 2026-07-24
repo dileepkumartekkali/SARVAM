@@ -22,7 +22,7 @@ from typing import Awaitable, Callable, AsyncIterator, Sequence
 from ..llm_adapter.base import LLMProviderError, LLMRouter, Message, ToolCall, ToolDefinition
 from ..observability.tracing import start_span
 from ..security.confirmation import ConfirmationGate, PendingConfirmation
-from ..security.output_validation import marker_safe_split, sanitize_llm_output, strip_tool_verified_marker
+from ..security.output_validation import sanitize_llm_output, stream_safe_sanitize
 from ..speech.chunker import chunk_stream
 from ..supervisor.state import Mode, SessionState
 from .cancellation import CancellationToken, TurnCancelled
@@ -309,6 +309,32 @@ def _parse_tool_call(raw: str, known_tool_names: frozenset[str] = frozenset()) -
     return None
 
 
+def _plain_text_messages(messages: list[dict]) -> list[dict]:
+    """Real bug hit live: the self-check correction retry sends `messages`
+    straight to `complete_with_fallback` (the plain-text completion path).
+    After any tool-using turn, `messages` contains the generic internal
+    tool-calling shapes -- `{"role": "assistant", "tool_calls": [...]}` and
+    `{"role": "tool", "tool_call_id": ..., "content": ...}` (appended above
+    for native calls) -- which only `complete_with_tools()`'s own
+    `_to_wire_message` translation understands. Every provider adapter
+    rejects these shapes on the plain path, the correction call fails, and
+    the failure is silently swallowed (see the correction retry's own
+    except LLMProviderError) -- so a turn that fails self-check after using
+    a tool never actually gets corrected. Collapsing both shapes into plain
+    content-only messages (matching what the LEGACY tool-call convention
+    already appends, which this same call has always handled fine) fixes it
+    without changing anything about the native tool-calling loop itself."""
+    plain = []
+    for m in messages:
+        if "tool_calls" in m:
+            plain.append({"role": "assistant", "content": m.get("content") or "(used a tool)"})
+        elif m.get("role") == "tool":
+            plain.append({"role": "user", "content": m.get("content", "")})
+        else:
+            plain.append(m)
+    return plain
+
+
 _SELF_CHECK_SYSTEM = (
     "You are a strict reviewer, not the assistant. You will be shown a draft reply, "
     "the mode it must obey, and the language the user should be answered in. Reply "
@@ -504,29 +530,47 @@ async def stream_turn(
     known_tool_names = frozenset((tools or {}).keys())
     with start_span("task_agent", "task_agent.stream_turn", mode=session.mode.value, prompt_version=version_id):
         accumulated: list[str] = []
-        # Real bug hit live, twice: sanitize_llm_output() only ever ran on
-        # the FINAL accumulated "done" text below -- but the frontend
+        # Real bug hit live, twice over: (1) sanitize_llm_output() only ever
+        # ran on the FINAL accumulated "done" text below -- but the frontend
         # renders progressively from live text_delta events as they stream
-        # in, well before "done" ever fires. A per-chunk-only strip was
-        # ALSO proven insufficient (this fix's own regression test caught
-        # it): the chunker can split the marker text itself across two
-        # separate deltas, so neither chunk alone contains the full string.
-        # marker_safe_split holds back a small tail buffer across chunk
-        # boundaries instead -- see its own docstring for the full reasoning.
+        # in, well before "done" ever fires, and that text is discarded on
+        # the success path anyway. A per-chunk-only strip was ALSO proven
+        # insufficient (this fix's own regression test caught it): the
+        # chunker can split a fixed marker string across two separate
+        # deltas, so neither chunk alone contains the full string. (2) The
+        # fix for that (marker_safe_split) only ever protected
+        # TOOL_VERIFIED_MARKER -- the system-prompt-leak refusal and
+        # script/HTML stripping never ran on live deltas at all, meaning a
+        # prompt-injected/malfunctioning model emitting the system prompt or
+        # a <script> payload reached the client verbatim. stream_safe_sanitize
+        # generalizes the same holdback approach to all three defenses.
         marker_tail = ""
+        leaked = False
         try:
             raw_stream = router.stream_with_fallback(messages, system=system_prompt)
             async for chunk in chunk_stream(_sniff_and_forward(raw_stream, known_tool_names)):
                 accumulated.append(chunk)
                 marker_tail += chunk
-                safe_text, marker_tail = marker_safe_split(marker_tail)
+                safe_text, marker_tail, leak_detected = stream_safe_sanitize(marker_tail)
                 if safe_text:
                     yield {"type": "text_delta", "text": safe_text}
-            # Stream ended normally -- nothing more can arrive to complete a
-            # marker spanning the tail, so whatever's left is safe to flush.
-            final_flush = strip_tool_verified_marker(marker_tail)
-            if final_flush:
-                yield {"type": "text_delta", "text": final_flush}
+                if leak_detected:
+                    # Already-yielded chunks before this point can't be
+                    # recalled over SSE, but nothing further of the leak
+                    # streams out -- stop consuming the rest of this
+                    # response entirely (never mind self-check on it below).
+                    leaked = True
+                    break
+            if not leaked:
+                # Stream ended normally -- nothing more can arrive to
+                # complete a marker/tag spanning the tail, so whatever's
+                # left is safe to flush as-is (no more holdback needed).
+                final_safe, final_tail, leak_detected = stream_safe_sanitize(marker_tail)
+                final_flush = final_safe + final_tail
+                if leak_detected:
+                    leaked = True
+                if final_flush:
+                    yield {"type": "text_delta", "text": final_flush}
         except _ToolCallDetected:
             result = await run_turn(
                 session,
@@ -572,6 +616,27 @@ async def stream_turn(
                 "self_check_reason": "",
                 "pending_confirmation": None,
                 "error": True,
+            }
+            return
+
+        if leaked:
+            # Skip self-check entirely -- there's no benefit to reviewing a
+            # response that's already been replaced with the fixed refusal,
+            # and it avoids sending the raw leaked system-prompt text to yet
+            # another LLM call. sanitize_llm_output(draft) below already
+            # detects the same leak markers in the full accumulated text and
+            # substitutes the identical refusal, so the "done" event's text
+            # comes out correct with no special-casing needed there.
+            logger.info("turn_trace", extra={"prompt_version": version_id, "streamed": True, "prompt_leak_detected": True})
+            yield {
+                "type": "done",
+                "text": sanitize_llm_output("".join(accumulated)),
+                "prompt_version": version_id,
+                "tool_call_count": 0,
+                "self_check_ok": True,
+                "self_check_reason": "",
+                "pending_confirmation": None,
+                "error": False,
             }
             return
 
@@ -858,7 +923,9 @@ async def run_turn(
                 messages.append({"role": "assistant", "content": draft})
                 messages.append({"role": "user", "content": correction_text})
                 try:
-                    correction_coro = router.complete_with_fallback(messages, system=system_prompt)
+                    correction_coro = router.complete_with_fallback(
+                        _plain_text_messages(messages), system=system_prompt
+                    )
                     draft = await (
                         cancellation_token.run(correction_coro) if cancellation_token is not None else correction_coro
                     )

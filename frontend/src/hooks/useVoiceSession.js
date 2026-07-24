@@ -228,8 +228,16 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
             socket.endTTSUtterance();
             await closed;
           }
-          setVoiceState(VoiceState.IDLE);
-          if (activeSpeakSessionRef.current === session) activeSpeakSessionRef.current = null;
+          // Real bug hit live: this ran unconditionally, but finish() is
+          // async and can complete AFTER a newer turn has already opened
+          // its own session and set SPEAKING -- a stale, already-aborted
+          // session's finish() forced the orb back to IDLE mid-speech for
+          // the CURRENT turn. Guarding it the same way as the ref-nulling
+          // right below (which was already correctly guarded) fixes it.
+          if (activeSpeakSessionRef.current === session) {
+            setVoiceState(VoiceState.IDLE);
+            activeSpeakSessionRef.current = null;
+          }
           return player.finish();
         },
         // Closes without ever speaking anything — for a turn that failed
@@ -295,7 +303,12 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
               // already skipped persisting it). It's still shown as a
               // message so the user knows what happened, silently.
               if (doneEvent.error) {
-                appendToMessage(assistantId, doneEvent.text);
+                // doneEvent.text isn't in the documented `done` event shape
+                // (chatClient.js only lists message_id/self_check_ok/
+                // pending_confirmation) -- falling back here instead of
+                // rendering the literal string "undefined" if an error-done
+                // event ever arrives without it.
+                appendToMessage(assistantId, doneEvent.text || "Sorry, something went wrong reaching the assistant.");
                 finishMessage(assistantId);
                 if (speakSession) speakSession.abort();
                 else setVoiceState(VoiceState.IDLE);

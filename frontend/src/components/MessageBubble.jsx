@@ -1,8 +1,15 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import { supabase } from "../api/supabaseClient";
 
 const SIGNED_URL_TTL_SECONDS = 60;
+
+// Real bug hit live: each MessageBubble only tracked its OWN `playing` state
+// -- tapping "Play" on message A then message B played both recordings
+// simultaneously, since nothing coordinated across instances. Module-level
+// (not component state) so every bubble shares the same "one replay at a
+// time" gate regardless of which one is mounted where.
+let _activeReplay = null;
 
 /** TEXT_MODE allows markdown (lists/headers/bold) per agent_system_prompt.md
  * — rendered here for assistant messages only. User messages are shown as
@@ -11,9 +18,27 @@ const SIGNED_URL_TTL_SECONDS = 60;
 export default function MessageBubble({ role, text, streaming, audioPath }) {
   const isUser = role === "user";
   const [playing, setPlaying] = useState(false);
+  const audioRef = useRef(null);
+  const mountedRef = useRef(true);
+
+  // Real bug hit live: nothing stopped a replay's audio when the bubble
+  // unmounted (switching conversations, message list re-rendering) -- the
+  // `Audio` element had no ref and no teardown, so it kept playing to
+  // completion over whatever the user navigated to next.
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      if (audioRef.current === _activeReplay) _activeReplay = null;
+      audioRef.current?.pause();
+    };
+  }, []);
 
   async function playRecording() {
     if (playing) return;
+    // Stop whatever else is currently playing before starting this one --
+    // see the module-level `_activeReplay` comment above.
+    _activeReplay?.pause();
     setPlaying(true);
     try {
       // Bucket is private (per-user RLS) — a signed URL is required, not the
@@ -23,13 +48,22 @@ export default function MessageBubble({ role, text, streaming, audioPath }) {
         .createSignedUrl(audioPath, SIGNED_URL_TTL_SECONDS);
       if (error || !data?.signedUrl) return;
       const audio = new Audio(data.signedUrl);
+      audioRef.current = audio;
+      _activeReplay = audio;
       await new Promise((resolve) => {
         audio.onended = resolve;
         audio.onerror = resolve;
+        // Fires when another bubble's playRecording() pauses THIS audio to
+        // start its own (the only thing that ever calls .pause() here,
+        // since there's no user-facing pause control) -- without this, an
+        // interrupted bubble's promise never settles and its "Playing…"
+        // state never resets.
+        audio.onpause = resolve;
         audio.play().catch(resolve);
       });
     } finally {
-      setPlaying(false);
+      if (audioRef.current === _activeReplay) _activeReplay = null;
+      if (mountedRef.current) setPlaying(false);
     }
   }
 

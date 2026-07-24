@@ -114,7 +114,7 @@ class SarvamSTTClient:
 
         try:
             async with self._connect(url, additional_headers={"Api-Subscription-Key": self._api_key()}) as ws:
-                send_task = asyncio.ensure_future(self._pump_audio(ws, audio, sample_rate))
+                send_task = asyncio.ensure_future(self._pump_audio(ws, audio, sample_rate, codec))
                 try:
                     # A plain `async for raw in ws` here waited on Sarvam's
                     # socket INDEFINITELY after the audio source ended —
@@ -179,13 +179,19 @@ class SarvamSTTClient:
         return None
 
     @staticmethod
-    async def _pump_audio(ws, audio: AsyncIterator[bytes], sample_rate: int) -> None:
+    async def _pump_audio(ws, audio: AsyncIterator[bytes], sample_rate: int, codec: str) -> None:
         async for chunk in audio:
             payload = {
                 "audio": {
                     "data": base64.b64encode(chunk).decode("ascii"),
                     "sample_rate": str(sample_rate),
-                    "encoding": "audio/wav",
+                    # Real gap: this was hardcoded to "audio/wav" regardless
+                    # of the codec actually negotiated in the connection URL
+                    # (input_audio_codec=codec, above) -- raw PCM frames were
+                    # labeled as WAV on every message. Using the real codec
+                    # keeps the per-frame label consistent with what the
+                    # connection itself declared.
+                    "encoding": codec,
                 }
             }
             await ws.send(json.dumps(payload))
