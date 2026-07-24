@@ -56,9 +56,20 @@ LANGUAGE_NAMES: dict[str, str] = {
     "ur": "Urdu",
 }
 
-# Below this, the caller (the LangGraph supervisor) should ask a clarifying
-# question rather than answer in a possibly-wrong language.
+# Below this, the caller should ask a clarifying question rather than answer
+# in a possibly-wrong language.
 LOW_CONFIDENCE_THRESHOLD = 0.5
+
+
+def is_low_confidence(confidence: float | None) -> bool:
+    """The one decision point for "ask a clarifying question instead of
+    answering" -- architecture gap closed: this exact check
+    (`confidence < LOW_CONFIDENCE_THRESHOLD`) used to be duplicated, once in
+    supervisor/graph.py's route_after_language (the LangGraph /chat path)
+    and once inline in api/main.py's /chat/stream (the endpoint production
+    traffic actually uses). Same policy, two copies to keep in sync by
+    hand. One function now; both callers defer to it."""
+    return (confidence or 0.0) < LOW_CONFIDENCE_THRESHOLD
 
 
 @dataclass

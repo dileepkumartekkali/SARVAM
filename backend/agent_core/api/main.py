@@ -22,7 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from ..agents.language_agent import LOW_CONFIDENCE_THRESHOLD, detect_language
+from ..agents.language_agent import detect_language, is_low_confidence
 from ..agents.task_agent import CLARIFYING_QUESTION, stream_turn
 from ..agents.translation_policy import decide_translation
 from ..llm_adapter import build_router_from_env
@@ -419,10 +419,12 @@ async def chat_stream(
             }
         )
 
-        # Mirrors graph.py's route_after_language — never call the LLM at all
-        # on low-confidence input, ask a deterministic clarifying question.
+        # Same decision as graph.py's route_after_language (both now defer
+        # to language_agent.is_low_confidence — one policy, not two copies
+        # of the same threshold check) — never call the LLM at all on
+        # low-confidence input, ask a deterministic clarifying question.
         is_error = False
-        if (lang_result.confidence or 0.0) < LOW_CONFIDENCE_THRESHOLD:
+        if is_low_confidence(lang_result.confidence):
             final_text = CLARIFYING_QUESTION
             self_check_ok = True
             pending = None

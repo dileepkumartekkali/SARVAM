@@ -3,7 +3,12 @@ independence, low-confidence routing, and translation policy."""
 
 import pytest
 
-from agent_core.agents.language_agent import LOW_CONFIDENCE_THRESHOLD, detect_language, resolve_tts_voice_language
+from agent_core.agents.language_agent import (
+    LOW_CONFIDENCE_THRESHOLD,
+    detect_language,
+    is_low_confidence,
+    resolve_tts_voice_language,
+)
 from agent_core.agents.translation_policy import decide_translation
 from agent_core.llm_adapter import LLMRouter
 
@@ -150,3 +155,12 @@ def test_mixed_script_message_uses_the_majority_script():
     voice; the threshold is majority, not purity (an occasional embedded
     English word, e.g. "office", shouldn't force an English voice)."""
     assert resolve_tts_voice_language("నేను ఈరోజు office కి వెళ్తాను ఎందుకంటే మీటింగ్ ఉంది", "te") == "te"
+
+
+def test_is_low_confidence_matches_the_threshold():
+    """Architecture gap closed: this exact check used to be duplicated,
+    once in supervisor/graph.py's route_after_language and once inline in
+    api/main.py's /chat/stream -- both now defer to this one function."""
+    assert is_low_confidence(LOW_CONFIDENCE_THRESHOLD - 0.01) is True
+    assert is_low_confidence(LOW_CONFIDENCE_THRESHOLD) is False
+    assert is_low_confidence(None) is True  # no confidence at all -- treat as low, not high

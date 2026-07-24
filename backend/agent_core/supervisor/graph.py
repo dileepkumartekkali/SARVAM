@@ -12,7 +12,7 @@ from typing import Sequence, TypedDict
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
 
-from ..agents.language_agent import LOW_CONFIDENCE_THRESHOLD, detect_language
+from ..agents.language_agent import detect_language, is_low_confidence
 from ..agents.task_agent import CLARIFYING_QUESTION, ToolFn, run_turn
 from ..agents.translation_policy import decide_translation
 from ..llm_adapter.base import LLMRouter, ToolDefinition
@@ -89,8 +89,7 @@ def build_text_graph(
         return {"session": session}
 
     def route_after_language(state: TextGraphState) -> str:
-        confidence = state["session"].language_confidence or 0.0
-        return "clarify" if confidence < LOW_CONFIDENCE_THRESHOLD else "task_agent"
+        return "clarify" if is_low_confidence(state["session"].language_confidence) else "task_agent"
 
     async def clarify_node(state: TextGraphState) -> dict:
         return {
