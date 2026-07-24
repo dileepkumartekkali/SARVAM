@@ -29,6 +29,14 @@ class BackendChatReply:
     text: str
     pending_confirmation_token: str | None = None
     pending_confirmation_tool: str | None = None
+    # Real gap: this was never read from the backend's response at all, even
+    # though /chat already returns it (api/main.py's ChatResponse). Nothing
+    # here forwarded the LLM's actual per-turn detected language back to the
+    # caller, so converse_ws had no way to speak a turn's reply in anything
+    # but the ONE static language the client happened to configure at
+    # connection time -- every turn for the rest of that session, regardless
+    # of what language the reply actually came back in.
+    response_language: str | None = None
 
 
 class BackendChatError(Exception):
@@ -79,4 +87,5 @@ async def call_backend_chat(
         text=body["response"],
         pending_confirmation_token=pending["token"] if pending else None,
         pending_confirmation_tool=pending["tool_name"] if pending else None,
+        response_language=body.get("response_language"),
     )

@@ -504,7 +504,11 @@ async def converse_ws(
                 confirmation_token=pending_confirmation_token,
             )
 
-    async def speak(text: str) -> None:
+    async def speak(text: str, *, language: str) -> None:
+        # `language` param shadows the outer session-initial closure variable
+        # of the same name on purpose -- see run_turn's own comment on why a
+        # turn's actual detected language, not the fixed session-initial
+        # one, must drive which voice speaks it.
         tts_client = tts_client_resolver(language)
 
         async def one_chunk():
@@ -538,7 +542,19 @@ async def converse_ws(
         pending_confirmation_token = reply.pending_confirmation_token
         await websocket.send_json({"type": "assistant_text", "text": reply.text})
 
-        speak_task = asyncio.ensure_future(speak(reply.text))
+        # Real bug hit live: this used to always speak using the ONE static
+        # `language` the client configured at connection time, for every
+        # turn in the session, regardless of what language the LLM actually
+        # detected and answered in for THIS turn (reply.response_language
+        # was never even read off the backend's response). "unknown" (a
+        # real value on low-confidence detection) is never passed through
+        # directly either -- confirmed live that Sarvam TTS 422s outright on
+        # it ("Input parameters has to be a valid dictionary"), same
+        # "unknown" -> "en" guard the frontend already applies for its own
+        # TTS socket path (useVoiceSession.js).
+        turn_language = reply.response_language
+        tts_language = turn_language if turn_language and turn_language != "unknown" else "en"
+        speak_task = asyncio.ensure_future(speak(reply.text, language=tts_language))
         duplex.start_speaking(speak_task)
         try:
             await speak_task

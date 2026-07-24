@@ -45,8 +45,10 @@ class ScriptedGatewaySTT:
 class RecordingGatewayTTS:
     def __init__(self):
         self.synthesized: list[str] = []
+        self.languages_used: list[str] = []
 
     async def synthesize(self, text_chunks, *, language, model="bulbul:v3", voice=None, pace=None):
+        self.languages_used.append(language)
         async for chunk in text_chunks:
             self.synthesized.append(chunk)
             yield f"AUDIO[{chunk}]".encode()
@@ -218,6 +220,79 @@ def test_backend_chat_failure_speaks_a_fixed_apology_not_a_crash():
         assert turn_complete == {"type": "turn_complete"}
     finally:
         gateway_app.dependency_overrides.clear()
+
+
+def test_speaks_using_the_turns_own_detected_language_not_the_session_initial_one():
+    """Real bug hit live: converse_ws used to always speak using the ONE
+    static `language` from the client's initial config, for every turn in
+    the session -- BackendChatReply never even carried response_language
+    back from the backend's /chat response. A user starting a session
+    configured for Hindi, then getting a reply the LLM actually answered in
+    Telugu, would have that Telugu text spoken with the Hindi voice
+    configuration instead of Telugu."""
+    stt = ScriptedGatewaySTT(events_per_frame=[[{"type": "transcript", "text": "hello", "is_final": True, "confidence": 0.9}]])
+    tts = RecordingGatewayTTS()
+
+    async def fake_chat_caller(**kwargs):
+        return BackendChatReply(text="Reply in Telugu", response_language="te")
+
+    _override(
+        {
+            get_stt_client: lambda: stt,
+            get_tts_client_resolver: lambda: (lambda language: tts),
+            get_chat_caller: lambda: fake_chat_caller,
+        }
+    )
+    try:
+        client = TestClient(gateway_app)
+        # Session configured for Hindi at connection time...
+        with client.websocket_connect("/ws/converse") as ws:
+            ws.send_text(_converse_config(language="hi"))
+            ws.send_bytes(_valid_frame())
+            ws.receive_json()  # transcript_final
+            ws.receive_json()  # assistant_text
+            ws.receive_bytes()  # audio
+            ws.receive_json()  # turn_complete
+    finally:
+        gateway_app.dependency_overrides.clear()
+
+    # ...but the reply actually came back in Telugu, so it must be SPOKEN in
+    # Telugu, not the session's initial Hindi configuration.
+    assert tts.languages_used == ["te"]
+
+
+def test_unknown_detected_language_falls_back_to_english_for_tts_not_sent_raw():
+    """Real bug hit live: passing language="unknown" straight through to
+    Sarvam TTS gets a real 422 ("Input parameters has to be a valid
+    dictionary") -- confirmed via a real API call, not assumed. Low language-
+    detection confidence is a real value response_language can carry; it
+    must never reach the TTS client as a literal string."""
+    stt = ScriptedGatewaySTT(events_per_frame=[[{"type": "transcript", "text": "hello", "is_final": True, "confidence": 0.9}]])
+    tts = RecordingGatewayTTS()
+
+    async def fake_chat_caller(**kwargs):
+        return BackendChatReply(text="low confidence reply", response_language="unknown")
+
+    _override(
+        {
+            get_stt_client: lambda: stt,
+            get_tts_client_resolver: lambda: (lambda language: tts),
+            get_chat_caller: lambda: fake_chat_caller,
+        }
+    )
+    try:
+        client = TestClient(gateway_app)
+        with client.websocket_connect("/ws/converse") as ws:
+            ws.send_text(_converse_config())
+            ws.send_bytes(_valid_frame())
+            ws.receive_json()
+            ws.receive_json()
+            ws.receive_bytes()
+            ws.receive_json()
+    finally:
+        gateway_app.dependency_overrides.clear()
+
+    assert tts.languages_used == ["en"]
 
 
 def test_barge_in_during_speaking_cancels_tts_and_emits_barge_in_event():
