@@ -24,10 +24,12 @@ import logging
 import os
 import time
 from collections import deque
+from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
+from ..agents.language_agent import SUPPORTED_LANGUAGES, resolve_tts_voice_language
 from ..observability.logging_config import configure_logging
 from ..observability.metrics import (
     active_voice_sessions,
@@ -47,7 +49,7 @@ from ..speech.clients import SpeechSTTClient, SpeechTTSClient, STTMode
 from ..speech.fallback_tts import AzureFallbackTTSClient
 from ..speech.sarvam_stt import SarvamSTTClient, SpeechStreamError
 from ..speech.sarvam_tts import SarvamTTSClient, TTSStreamError
-from ..speech.tts_provider_policy import select_tts_provider
+from ..speech.tts_provider_policy import languages_missing_tts_coverage, select_tts_provider
 from ..supervisor.session_state_machine import SessionPhase
 from .backend_client import BackendChatError, BackendChatReply, call_backend_chat
 from .duplex_session import DuplexSession
@@ -64,7 +66,30 @@ configure_logging()
 init_tracing("speech_gateway")
 logger = logging.getLogger("agent_core.speech_gateway")
 
-gateway_app = FastAPI(title="MAAV Speech Gateway", version="0.1.0")
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    # Architecture gap closed: nothing previously checked, at boot, whether
+    # every language SUPPORTED_LANGUAGES claims to support actually has a
+    # working TTS path. Assamese/Urdu route to the Azure fallback provider
+    # by design -- if that fallback was never configured, those languages
+    # silently have no voice output, discoverable previously only by a real
+    # user hitting it live. This never blocks boot (matches every other
+    # optional-at-runtime key check in this codebase) -- it just makes the
+    # gap loud instead of silent.
+    fallback_configured = bool(os.environ.get("AZURE_SPEECH_KEY")) and bool(os.environ.get("AZURE_SPEECH_REGION"))
+    missing = languages_missing_tts_coverage(SUPPORTED_LANGUAGES, fallback_configured=fallback_configured)
+    if missing:
+        logger.warning(
+            "TTS coverage gap at startup: %s %s no working voice-output path "
+            "(routed to the Azure fallback provider, which isn't configured -- "
+            "set AZURE_SPEECH_KEY and AZURE_SPEECH_REGION to fix this).",
+            ", ".join(missing),
+            "has" if len(missing) == 1 else "have",
+        )
+    yield
+
+
+gateway_app = FastAPI(title="MAAV Speech Gateway", version="0.1.0", lifespan=_lifespan)
 
 _allowed_origins = [o for o in os.environ.get("CORS_ALLOWED_ORIGINS", "").split(",") if o]
 gateway_app.add_middleware(
@@ -94,8 +119,9 @@ _CLIENT_IDLE_TIMEOUT_SECONDS = 10.0
 # Voice sessions cost more than text turns — the cost-exhaustion abuse surface
 # is bigger, so session *creation* (not every frame) is rate-limited per
 # client IP. Env-configurable so a load test (or a deployment with known
-# higher legitimate traffic) can tune it without a code change; single-
-# process/in-memory — see security/rate_limit.py's note on multi-replica scaling.
+# higher legitimate traffic) can tune it without a code change. Shared across
+# replicas via Redis when REDIS_URL is configured, in-memory/single-process
+# otherwise — see security/rate_limit.py's own module docstring.
 _session_rate_limiter = SlidingWindowRateLimiter(
     max_requests=int(os.environ.get("STT_SESSION_RATE_LIMIT", "10")),
     window_seconds=float(os.environ.get("STT_SESSION_RATE_WINDOW_SECONDS", "60")),
@@ -169,7 +195,7 @@ def get_chat_caller():
 @gateway_app.websocket("/ws/stt")
 async def stt_ws(websocket: WebSocket, stt_client: SpeechSTTClient = Depends(get_stt_client)):
     client_key = websocket.client.host if websocket.client else "unknown"
-    if not _session_rate_limiter.allow(client_key):
+    if not await _session_rate_limiter.allow(client_key):
         errors_total.labels(stage="rate_limit").inc()
         await _safe_close(websocket, code=1008, reason="rate limit exceeded")
         return
@@ -261,7 +287,7 @@ async def tts_ws(websocket: WebSocket, tts_client_resolver=Depends(get_tts_clien
     # and drive unbounded billed Sarvam synthesis calls, sidestepping the
     # exact abuse control rate_limit.py was built for.
     client_key = websocket.client.host if websocket.client else "unknown"
-    if not _session_rate_limiter.allow(client_key):
+    if not await _session_rate_limiter.allow(client_key):
         errors_total.labels(stage="rate_limit").inc()
         await _safe_close(websocket, code=1008, reason="rate limit exceeded")
         return
@@ -418,7 +444,7 @@ async def converse_ws(
     not a direct import (separate processes, separate key sets).
     """
     client_key = websocket.client.host if websocket.client else "unknown"
-    if not _session_rate_limiter.allow(client_key):
+    if not await _session_rate_limiter.allow(client_key):
         errors_total.labels(stage="rate_limit").inc()
         await _safe_close(websocket, code=1008, reason="rate limit exceeded")
         return
@@ -551,9 +577,14 @@ async def converse_ws(
         # directly either -- confirmed live that Sarvam TTS 422s outright on
         # it ("Input parameters has to be a valid dictionary"), same
         # "unknown" -> "en" guard the frontend already applies for its own
-        # TTS socket path (useVoiceSession.js).
-        turn_language = reply.response_language
-        tts_language = turn_language if turn_language and turn_language != "unknown" else "en"
+        # TTS socket path (useVoiceSession.js). resolve_tts_voice_language
+        # additionally falls back to English when the USER'S OWN message is
+        # romanized (Latin-script) rather than native-script -- confirmed
+        # live that Sarvam's Indic voices badly mangle romanized text even
+        # when the target language is genuinely correct (see its own
+        # docstring). The ANSWER TEXT itself (reply.text) is untouched and
+        # still in the detected language -- only the VOICE selection changes.
+        tts_language = resolve_tts_voice_language(transcript, reply.response_language)
         speak_task = asyncio.ensure_future(speak(reply.text, language=tts_language))
         duplex.start_speaking(speak_task)
         try:

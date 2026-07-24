@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import Awaitable, Callable, AsyncIterator, Sequence
 
 from ..llm_adapter.base import LLMProviderError, LLMRouter, Message, ToolCall, ToolDefinition
+from ..observability.metrics import self_check_uncorrected_total
 from ..observability.tracing import start_span
 from ..security.confirmation import ConfirmationGate, PendingConfirmation
 from ..security.output_validation import sanitize_llm_output, stream_safe_sanitize
@@ -209,18 +210,29 @@ def _turn_directive(session: SessionState, user_message: str) -> str:
 
 # Real bug hit live, repeatedly, after every prompt-level fix already tried
 # here (tool description rewrite, history-verification marker): whether the
-# model chooses to call search_company_knowledge at ALL is model judgment,
-# not a guarantee -- live re-testing kept showing it skipped for company-
-# name queries and hallucinated a confident wrong answer instead. For the
-# one clear, high-precision signal available -- the user's own message
-# explicitly naming "mtouch" -- retrieval is now forced in code, never left
-# to the model's discretion, same "enforced in code, not a prompt
-# instruction a model could ignore" philosophy as security/confirmation.py's
-# gate. False-positive risk is effectively zero (nobody says "mtouch"
-# unless asking about this specific company); the cost is one extra
-# embedding+DB lookup only for messages that actually name it.
-_FORCED_RETRIEVAL_TOOL_NAME = "search_company_knowledge"
-_FORCED_RETRIEVAL_KEYWORD = "mtouch"
+# model chooses to call a retrieval tool AT ALL is model judgment, not a
+# guarantee -- live re-testing kept showing it skipped for company-name
+# queries and hallucinated a confident wrong answer instead. For a clear,
+# high-precision signal -- the user's own message explicitly naming the
+# thing a tool covers -- retrieval is forced in code, never left to the
+# model's discretion, same "enforced in code, not a prompt instruction a
+# model could ignore" philosophy as security/confirmation.py's gate.
+#
+# Architecture gap closed: this used to be a single hardcoded keyword+tool
+# pair. A registry (keyword -> tool name) is the same amount of code for
+# today's one entry, but means a second forced-retrieval topic doesn't
+# require hand-writing a near-duplicate of this whole function again --
+# just one more line here. First matching entry wins (in list order); a
+# message matching more than one registered keyword only forces the first
+# match's tool, not all of them, to avoid re-introducing the same
+# context-length-explosion class of bug _FORCED_CONTEXT_MAX_CHARS exists
+# for for a rare multi-topic message.
+_FORCED_RETRIEVAL_REGISTRY: list[tuple[str, str]] = [
+    # False-positive risk is effectively zero (nobody says "mtouch" unless
+    # asking about this specific company); the cost is one extra
+    # embedding+DB lookup only for messages that actually name it.
+    ("mtouch", "search_company_knowledge"),
+]
 
 # Real bug hit live, severe: a broad "tell me services in detail" query
 # pulled 24,526 characters (~6,131 tokens) of raw retrieved content -- for
@@ -238,12 +250,17 @@ _FORCED_CONTEXT_MAX_CHARS = 3000
 
 
 async def _forced_company_context(user_message: str, tools: dict[str, ToolFn] | None) -> str | None:
-    if not tools or _FORCED_RETRIEVAL_TOOL_NAME not in tools:
+    if not tools:
         return None
-    if _FORCED_RETRIEVAL_KEYWORD not in user_message.lower().replace(" ", ""):
+    normalized = user_message.lower().replace(" ", "")
+    tool_name = next(
+        (name for keyword, name in _FORCED_RETRIEVAL_REGISTRY if keyword in normalized and name in tools),
+        None,
+    )
+    if tool_name is None:
         return None
     try:
-        context = await tools[_FORCED_RETRIEVAL_TOOL_NAME](query=user_message)
+        context = await tools[tool_name](query=user_message)
     except Exception:  # noqa: BLE001 -- this runs BEFORE any LLM call in
         # both run_turn and stream_turn; search_company_knowledge already
         # catches its own known failure modes and returns an error string
@@ -273,7 +290,10 @@ def _with_forced_context(directive_and_message: str, forced_context: str | None)
         return directive_and_message
     return (
         "[The following was already retrieved from mTouch Labs' real website content — "
-        f"use it directly to answer; do not guess or use any other name/fact]\n{forced_context}\n\n{directive_and_message}"
+        "use it directly to answer; do not guess or use any other name/fact. This "
+        "reference material is in English — your ANSWER must still be in the user's own "
+        f"detected language below, not English just because the source material is.]\n"
+        f"{forced_context}\n\n{directive_and_message}"
     )
 
 
@@ -335,12 +355,28 @@ def _plain_text_messages(messages: list[dict]) -> list[dict]:
     return plain
 
 
+# Safety ceilings only, not brevity targets -- the prompt files
+# (prompts/voice_mode_system.v1.txt, prompts/text_mode_system.v1.txt) now
+# say "answer completely and sufficiently," not "keep it under N words."
+# These exist purely to catch a genuinely malfunctioning response (e.g. a
+# repetition loop) rather than to truncate a real, complete, non-padded
+# answer to a detailed or multi-part question.
+_VOICE_MODE_LENGTH_CEILING_WORDS = 300
+_TEXT_MODE_LENGTH_CEILING_WORDS = 500
+
 _SELF_CHECK_SYSTEM = (
     "You are a strict reviewer, not the assistant. You will be shown a draft reply, "
     "the mode it must obey, and the language the user should be answered in. Reply "
     'with exactly one line: "OK" if the draft is compliant, or "VIOLATION: <short '
-    'reason>" if not. VOICE_MODE rules: no markdown, no emoji, no parentheticals, at '
-    "most ~6 sentences. TEXT_MODE rules: markdown is allowed, at most ~150 words. "
+    'reason>" if not. VOICE_MODE rules: no markdown, no emoji, no parentheticals. '
+    "TEXT_MODE rules: markdown is allowed. LENGTH rule (both modes): the answer should "
+    "be as long as the question genuinely requires — do NOT reject a long answer just "
+    "for being long if every sentence carries real information the user asked for. "
+    "Reject ONLY if the draft pads with filler, restates the question, repeats the "
+    "same point more than once, or is unreasonably long for what was actually asked "
+    "(as a hard safety ceiling against a genuinely malfunctioning response: "
+    "over ~300 words for VOICE_MODE, or over ~500 words for TEXT_MODE, is a violation "
+    "regardless of content, since that's no longer a normal complete answer). "
     "LANGUAGE rule (both modes): reject ONLY if the draft is answered in a clearly "
     "different language than the target (e.g. target is Telugu or Telugu-English "
     "code-mixed, but the draft is plain, unrelated English) — natural code-mixing "
@@ -369,10 +405,15 @@ async def _self_check(
     if mode.is_voice:
         if any(marker in draft for marker in ("**", "##", "- ", "* ", "```")):
             return False, "voice-mode formatting violation: markdown present"
-        if word_count > 90:
+        # Raised from 90 -- that was a hard brevity cap that truncated
+        # genuinely complete answers to multi-part/detailed questions. This
+        # is now a safety ceiling only, catching a genuinely malfunctioning
+        # (e.g. repetition-looping) response, not a normal complete answer.
+        if word_count > _VOICE_MODE_LENGTH_CEILING_WORDS:
             return False, "voice-mode length violation"
     else:
-        if word_count > 160:
+        # Raised from 160, same reasoning.
+        if word_count > _TEXT_MODE_LENGTH_CEILING_WORDS:
             return False, "text-mode length violation"
 
     # Deterministic, not left to the LLM reviewer below: verified live BOTH
@@ -668,7 +709,11 @@ async def stream_turn(
         # No correction-retry here, deliberately — see the module-level note
         # above. A failure is logged so it's visible in traces, not silently
         # dropped, but the already-streamed text stands as the shown/spoken
-        # output either way.
+        # output either way. self_check_uncorrected_total makes this a
+        # directly queryable rate, not just a thing you'd find by grepping
+        # logs after the fact.
+        if not self_check_ok:
+            self_check_uncorrected_total.inc()
         # Counts as 1, not 0, when forced_context was injected -- this WAS a
         # real tool-backed answer (just dispatched in code, not by the
         # model's own choice), and callers (api/main.py, graph.py) key the
@@ -832,11 +877,11 @@ async def run_turn(
                         confirmed = (
                             confirmation_token is not None
                             and confirmation_gate is not None
-                            and confirmation_gate.consume(confirmation_token, call.name, call.args)
+                            and await confirmation_gate.consume(confirmation_token, call.name, call.args)
                         )
                         if not confirmed:
                             pending = (
-                                confirmation_gate.request_confirmation(call.name, call.args)
+                                await confirmation_gate.request_confirmation(call.name, call.args)
                                 if confirmation_gate is not None
                                 else PendingConfirmation(token="", tool_name=call.name, args=call.args)
                             )

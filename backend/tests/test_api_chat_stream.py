@@ -156,3 +156,52 @@ def test_chat_stream_history_marks_tool_verified_turns_only(monkeypatch):
     assistant_entries = [m["content"] for m in history if m["role"] == "assistant"]
     assert TOOL_VERIFIED_MARKER in assistant_entries[0]  # the tool-using turn
     assert TOOL_VERIFIED_MARKER not in assistant_entries[1]  # the plain turn
+
+
+class _FakeStreamHistoryRedis:
+    """Minimal in-memory stand-in for the redis.asyncio.Redis calls
+    _stream_history_get/_set actually make -- no real Redis needed."""
+
+    def __init__(self):
+        self._store: dict[str, str] = {}
+
+    async def get(self, key):
+        return self._store.get(key)
+
+    async def set(self, key, value, ex=None):
+        self._store[key] = value
+
+
+async def test_stream_history_redis_path_round_trips_through_a_real_turn(monkeypatch):
+    """Architecture gap closed: this cache used to be in-memory/single-
+    process only -- a follow-up turn routed to a different instance
+    silently lost the whole conversation. With REDIS_URL configured, the
+    same conversation-context behavior is preserved through Redis instead."""
+    monkeypatch.setattr(main_module, "_stream_history_redis", _FakeStreamHistoryRedis())
+    monkeypatch.setattr(main_module, "_stream_history_redis_checked", True)
+    monkeypatch.setenv("JWT_SIGNING_SECRET", "test-secret")
+    provider = ScriptedProvider(
+        ["Nice to meet you, Bob.", "OK", "Your name is Bob.", "OK"]
+    )
+    monkeypatch.setattr(main_module, "_router", LLMRouter([provider]))
+    client = TestClient(app)
+
+    body = {**_REQUEST_BODY, "thread_id": "redis-thread"}
+    client.post(
+        "/chat/stream",
+        json={**body, "message": "my name is Bob"},
+        headers=_auth_header(subject="redis-user"),
+    )
+    client.post(
+        "/chat/stream",
+        json={**body, "message": "what is my name"},
+        headers=_auth_header(subject="redis-user"),
+    )
+
+    # The second turn's own LLM call must have seen the first turn's history
+    # -- proving it round-tripped through the fake Redis store, not the
+    # in-memory OrderedDict (which was never touched -- see the assert below).
+    second_call_messages = provider.messages_by_call[2]
+    combined = " ".join(str(m["content"]) for m in second_call_messages)
+    assert "Bob" in combined
+    assert ("redis-user", "redis-thread") not in main_module._stream_history

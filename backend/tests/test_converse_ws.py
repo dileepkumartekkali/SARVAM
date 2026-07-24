@@ -229,8 +229,13 @@ def test_speaks_using_the_turns_own_detected_language_not_the_session_initial_on
     back from the backend's /chat response. A user starting a session
     configured for Hindi, then getting a reply the LLM actually answered in
     Telugu, would have that Telugu text spoken with the Hindi voice
-    configuration instead of Telugu."""
-    stt = ScriptedGatewaySTT(events_per_frame=[[{"type": "transcript", "text": "hello", "is_final": True, "confidence": 0.9}]])
+    configuration instead of Telugu.
+
+    Transcript is native-script Telugu (not "hello") so this test isn't
+    confounded by resolve_tts_voice_language's OWN romanized-text safety net
+    (see test_falls_back_to_english_voice_for_a_romanized_transcript below,
+    which tests that behavior on its own)."""
+    stt = ScriptedGatewaySTT(events_per_frame=[[{"type": "transcript", "text": "మీరు ఎలా ఉన్నారు", "is_final": True, "confidence": 0.9}]])
     tts = RecordingGatewayTTS()
 
     async def fake_chat_caller(**kwargs):
@@ -259,6 +264,47 @@ def test_speaks_using_the_turns_own_detected_language_not_the_session_initial_on
     # ...but the reply actually came back in Telugu, so it must be SPOKEN in
     # Telugu, not the session's initial Hindi configuration.
     assert tts.languages_used == ["te"]
+
+
+def test_falls_back_to_english_voice_for_a_romanized_transcript():
+    """Real bug hit live (round-trip WER testing, this session): Sarvam's
+    Indic voices badly mangle ROMANIZED (Latin-script) text even when the
+    target language is genuinely correct -- WER 0.75-1.25 on real romanized
+    Telugu/Hindi/English mixes, including a specific word ("Bro")
+    mispronounced twice independently. detect_language correctly identifies
+    "Bro meeting ki vasthunnava?" as Telugu (code-mixed) -- but speaking it
+    with a Telugu VOICE is exactly the failure mode confirmed live. The
+    reply TEXT must still be in the detected language; only the VOICE
+    should fall back to English."""
+    stt = ScriptedGatewaySTT(
+        events_per_frame=[[{"type": "transcript", "text": "Bro meeting ki vasthunnava?", "is_final": True, "confidence": 0.9}]]
+    )
+    tts = RecordingGatewayTTS()
+
+    async def fake_chat_caller(**kwargs):
+        return BackendChatReply(text="Reply text stays in Telugu, unaffected", response_language="te")
+
+    _override(
+        {
+            get_stt_client: lambda: stt,
+            get_tts_client_resolver: lambda: (lambda language: tts),
+            get_chat_caller: lambda: fake_chat_caller,
+        }
+    )
+    try:
+        client = TestClient(gateway_app)
+        with client.websocket_connect("/ws/converse") as ws:
+            ws.send_text(_converse_config())
+            ws.send_bytes(_valid_frame())
+            ws.receive_json()  # transcript_final
+            assistant_msg = ws.receive_json()  # assistant_text
+            ws.receive_bytes()  # audio
+            ws.receive_json()  # turn_complete
+    finally:
+        gateway_app.dependency_overrides.clear()
+
+    assert "Reply text stays in Telugu" in assistant_msg["text"]
+    assert tts.languages_used == ["en"]
 
 
 def test_unknown_detected_language_falls_back_to_english_for_tts_not_sent_raw():

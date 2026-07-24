@@ -8,8 +8,11 @@ services:
     ports:
       - "9000:9000"
     environment:
-      # Consumed once the checkpointer/session store is wired (later phase).
-      # Present now so the compose contract is stable.
+      # Backs the rate limiter, confirmation gate, and /chat/stream's
+      # conversation-history cache -- shared across replicas instead of
+      # each being single-process/in-memory. See each module's own
+      # docstring (security/rate_limit.py, security/confirmation.py,
+      # api/main.py's _stream_history section).
       REDIS_URL: redis://redis:6379/0
       POSTGRES_DSN: postgresql://maav:maav@postgres:5432/maav
       # Phase 6: JWT signing secret for /chat auth. Set a real one in prod —

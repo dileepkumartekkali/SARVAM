@@ -1,6 +1,7 @@
 """Tool-call budget enforcement, self-check, and TEXT_MODE markdown/length —
 all against fake providers (no network, no real API keys needed)."""
 
+import agent_core.agents.task_agent as task_agent_module
 from agent_core.agents.task_agent import LLM_UNAVAILABLE_APOLOGY, CLARIFYING_QUESTION, _self_check, run_turn
 from agent_core.llm_adapter import LLMRouter
 from agent_core.llm_adapter.base import LLMProviderError
@@ -92,6 +93,36 @@ async def test_run_turn_forces_retrieval_when_message_names_the_company():
     assert "REAL FACT" in str(provider.messages_by_call[0])
 
 
+async def test_forced_retrieval_registry_generalizes_to_a_second_topic(monkeypatch):
+    """Architecture gap closed: forced retrieval used to be one hardcoded
+    keyword+tool pair. _FORCED_RETRIEVAL_REGISTRY is a list of (keyword,
+    tool) pairs so a second forced-retrieval topic is one more entry, not a
+    duplicated function. Proves a SECOND entry (unrelated to "mtouch")
+    forces its own tool correctly, and that the original "mtouch" entry
+    still works unaffected."""
+    monkeypatch.setattr(
+        task_agent_module,
+        "_FORCED_RETRIEVAL_REGISTRY",
+        [
+            ("mtouch", "search_company_knowledge"),
+            ("weather", "get_weather"),
+        ],
+    )
+    provider = ScriptedProvider(["It's sunny today.", "OK"])
+    router = LLMRouter([provider])
+
+    async def fake_weather(query: str) -> str:
+        return "REAL FACT: it is sunny in Hyderabad today."
+
+    result = await run_turn(
+        _session(), router, "what's the weather like",
+        tools={"get_weather": fake_weather},
+    )
+
+    assert result.tool_call_count == 1
+    assert "REAL FACT" in str(provider.messages_by_call[0])
+
+
 async def test_legacy_bare_tool_name_call_without_wrapper_is_recognized():
     """Real bug hit live: the model called a tool by writing its name
     directly -- "search_company_knowledge: {...}" -- with no "TOOL_CALL:"
@@ -137,13 +168,33 @@ async def test_text_mode_allows_markdown_and_respects_length_cap():
 
 
 async def test_self_check_flags_text_mode_length_violation():
-    long_draft = "word " * 200
+    """The length check is now a safety CEILING (500 words text / 300 voice)
+    against a genuinely malfunctioning response, not a brevity cap -- see
+    test_self_check_allows_a_genuinely_long_complete_answer below for the
+    other half of this change."""
+    long_draft = "word " * 600
     router = LLMRouter([ScriptedProvider(["unused"])])
 
     ok, reason = await _self_check(long_draft, Mode.TEXT_TO_TEXT, router)
 
     assert ok is False
     assert "length" in reason
+
+
+async def test_self_check_allows_a_genuinely_long_complete_answer():
+    """Real change: the old 90-word (voice) / 160-word (text) caps were a
+    brevity TARGET, truncating genuinely complete answers to detailed or
+    multi-part questions. The length rule is now a much higher safety
+    ceiling only -- a real, non-padded 300-word text answer (well under the
+    new 500-word ceiling) must not be flagged just for being longer than
+    the old cap."""
+    long_but_legitimate_draft = "This is a detailed point with real information. " * 40  # ~320 words
+    router = LLMRouter([ScriptedProvider(["OK"])])
+
+    ok, reason = await _self_check(long_but_legitimate_draft, Mode.TEXT_TO_TEXT, router)
+
+    assert ok is True
+    assert reason == ""
 
 
 async def test_self_check_flags_voice_mode_markdown_violation():

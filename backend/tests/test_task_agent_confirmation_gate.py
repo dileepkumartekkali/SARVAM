@@ -45,7 +45,7 @@ async def test_write_scope_tool_in_voice_mode_is_blocked_without_confirmation():
 
 async def test_write_scope_tool_executes_once_confirmation_token_matches():
     gate = ConfirmationGate()
-    pending = gate.request_confirmation("delete_account", {"account_id": "42"})
+    pending = await gate.request_confirmation("delete_account", {"account_id": "42"})
     provider = ScriptedProvider([DELETE_CALL, "Done, your account has been deleted.", "OK"])
     router = LLMRouter([provider])
 
@@ -65,7 +65,7 @@ async def test_write_scope_tool_executes_once_confirmation_token_matches():
 
 async def test_mismatched_confirmation_token_is_rejected_not_executed():
     gate = ConfirmationGate()
-    pending = gate.request_confirmation("delete_account", {"account_id": "99"})  # different args
+    pending = await gate.request_confirmation("delete_account", {"account_id": "99"})  # different args
     provider = ScriptedProvider([DELETE_CALL, "unused"])
     router = LLMRouter([provider])
 
@@ -103,7 +103,7 @@ async def test_write_scope_tool_in_text_mode_does_not_require_confirmation():
 
 async def test_replayed_token_cannot_be_reused_for_a_second_execution():
     gate = ConfirmationGate()
-    pending = gate.request_confirmation("delete_account", {"account_id": "42"})
+    pending = await gate.request_confirmation("delete_account", {"account_id": "42"})
     provider = ScriptedProvider([DELETE_CALL, "Done.", "OK", DELETE_CALL, "unused"])
     router = LLMRouter([provider])
 

@@ -286,3 +286,36 @@ async def detect_language(
     if result is None:
         result = LanguageDetectionResult(language="unknown", confidence=0.2, is_code_mixed=False)
     return result
+
+
+def resolve_tts_voice_language(user_message: str, detected_language: str | None) -> str:
+    """Which language's Sarvam voice should speak the reply to `user_message`
+    — separate from `detected_language` (which is still used for the ANSWER
+    TEXT, unchanged). Real gap confirmed via live TTS->STT round-trip WER
+    testing: Sarvam's Indic voices handle NATIVE-SCRIPT text cleanly (WER
+    0.00 across all 11 testable languages) but badly mangle ROMANIZED
+    (Latin-script) text even when the target language is genuinely Telugu/
+    Hindi/etc (WER 0.75-1.25 on real romanized code-mixed samples, including
+    a specific word — "Bro" — mispronounced as "Uru" in two independent
+    test runs). This isn't about which language the words are in, it's
+    about which SCRIPT the text is actually written in when it reaches the
+    TTS API — so this checks the user's own message's script profile
+    (available immediately, before any reply text exists — the frontend
+    opens its TTS socket right after language detection, before the answer
+    is generated, so there's nothing else to check yet at that point).
+
+    A comparable Twilio-based voice agent avoids this failure mode entirely
+    by defaulting straight to English for any input without a dominant
+    Indic script — this mirrors that safety net without discarding this
+    codebase's own richer text-language detection (still used for the
+    ANSWER's actual language/code-mixing, which that simpler system can't do
+    at all).
+    """
+    if not detected_language or detected_language in ("en", "unknown"):
+        return "en"
+    profile = _script_profile(user_message)
+    total = sum(profile.values())
+    if total == 0:
+        return detected_language  # no script signal either way -- trust detection as-is
+    indic_chars = total - profile.get("latin", 0)
+    return detected_language if indic_chars / total > 0.5 else "en"

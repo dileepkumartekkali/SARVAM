@@ -15,6 +15,7 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager
 from typing import Literal
 
+import redis.asyncio as redis
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -119,8 +120,19 @@ _STREAM_MAX_HISTORY_MESSAGES = 20
 # long-running process accumulates one permanent entry per thread ever seen,
 # unbounded memory growth. OrderedDict + evicting the oldest key once over
 # the cap gives it a bound without needing a new dependency.
+#
+# Architecture gap closed: this in-memory cache was also single-process --
+# a follow-up turn routed to a different instance silently lost the entire
+# conversation context, with no error, just the model "forgetting" what was
+# just discussed. Backed by Redis (one key per thread, JSON-encoded, with a
+# TTL instead of a count-based LRU -- Redis's natural idiom) when REDIS_URL
+# is configured, shared across replicas; falls back to the exact previous
+# in-memory OrderedDict behavior otherwise.
 _STREAM_HISTORY_MAX_THREADS = 1000
+_STREAM_HISTORY_TTL_SECONDS = 3600  # Redis path only -- idle threads expire instead of needing a count cap
 _stream_history: "OrderedDict[tuple[str, str], list[dict]]" = OrderedDict()
+_stream_history_redis: "redis.Redis | None" = None
+_stream_history_redis_checked = False
 # Real gap: the read (get history) and write (save history + turn) below
 # straddle many `await` points inside stream_turn with nothing serializing
 # them -- two concurrent /chat/stream requests for the SAME (user, thread)
@@ -128,7 +140,51 @@ _stream_history: "OrderedDict[tuple[str, str], list[dict]]" = OrderedDict()
 # overwrites the other's turn. A per-key lock (bounded together with
 # _stream_history's own eviction below) serializes same-thread turns without
 # affecting different threads/users, which run fully in parallel as before.
+# Kept process-local even on the Redis path -- a real distributed lock would
+# need its own expiry/renewal story for a lock held across an entire
+# streamed turn (seconds), disproportionate complexity for a race that's
+# already rare (concurrent turns on the exact same thread) and, on the Redis
+# path, only risks a lost update to the shared cache, not data loss (the
+# durable history lives in chat_store's Postgres persistence regardless).
 _stream_history_locks: dict[tuple[str, str], asyncio.Lock] = {}
+
+
+def _get_stream_history_redis() -> "redis.Redis | None":
+    global _stream_history_redis, _stream_history_redis_checked
+    if not _stream_history_redis_checked:
+        _stream_history_redis_checked = True
+        url = os.environ.get("REDIS_URL")
+        if url:
+            _stream_history_redis = redis.from_url(url)
+    return _stream_history_redis
+
+
+def _stream_history_redis_key(key: tuple[str, str]) -> str:
+    subject, thread_id = key
+    return f"streamhistory:{subject}:{thread_id}"
+
+
+async def _stream_history_get(key: tuple[str, str]) -> list[dict]:
+    r = _get_stream_history_redis()
+    if r is not None:
+        raw = await r.get(_stream_history_redis_key(key))
+        return json.loads(raw) if raw else []
+    history = _stream_history.get(key, [])
+    if key in _stream_history:
+        _stream_history.move_to_end(key)
+    return history
+
+
+async def _stream_history_set(key: tuple[str, str], messages: list[dict]) -> None:
+    r = _get_stream_history_redis()
+    if r is not None:
+        await r.set(_stream_history_redis_key(key), json.dumps(messages), ex=_STREAM_HISTORY_TTL_SECONDS)
+        return
+    _stream_history[key] = messages
+    _stream_history.move_to_end(key)
+    if len(_stream_history) > _STREAM_HISTORY_MAX_THREADS:
+        evicted_key, _ = _stream_history.popitem(last=False)
+        _stream_history_locks.pop(evicted_key, None)
 # One gate for the process, not per-request — a confirmation issued on turn N
 # must still be redeemable on turn N+1 (same reasoning as build_text_graph's).
 _stream_confirmation_gate = ConfirmationGate() if _tool_registry.write_scope_names() else None
@@ -359,9 +415,7 @@ async def chat_stream(req: ChatRequest, principal: Principal = Depends(get_curre
             history_key = (principal.subject, req.thread_id)
             history_lock = _stream_history_locks.setdefault(history_key, asyncio.Lock())
             async with history_lock:
-                history = _stream_history.get(history_key, [])
-                if history_key in _stream_history:
-                    _stream_history.move_to_end(history_key)
+                history = await _stream_history_get(history_key)
                 final_event = None
                 async for event in stream_turn(
                     session,
@@ -399,13 +453,12 @@ async def chat_stream(req: ChatRequest, principal: Principal = Depends(get_curre
                     history_text = final_text
                     if final_event.get("tool_call_count", 0) > 0:
                         history_text = f"{final_text}\n{TOOL_VERIFIED_MARKER}"
-                    _stream_history[history_key] = (
-                        history + [{"role": "user", "content": req.message}, {"role": "assistant", "content": history_text}]
-                    )[-_STREAM_MAX_HISTORY_MESSAGES:]
-                    _stream_history.move_to_end(history_key)
-                    if len(_stream_history) > _STREAM_HISTORY_MAX_THREADS:
-                        evicted_key, _ = _stream_history.popitem(last=False)
-                        _stream_history_locks.pop(evicted_key, None)
+                    await _stream_history_set(
+                        history_key,
+                        (history + [{"role": "user", "content": req.message}, {"role": "assistant", "content": history_text}])[
+                            -_STREAM_MAX_HISTORY_MESSAGES:
+                        ],
+                    )
 
         # A failed turn (is_error) is shown to the user but never persisted —
         # it's not a real answer, so it shouldn't clutter their saved history.

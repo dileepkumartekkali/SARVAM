@@ -8,6 +8,51 @@ import { ConnectionState, Mode, VoiceState, useAppStore } from "../store/useAppS
 
 const TTS_AUDIO_BUCKET = "tts-audio";
 
+// Unicode ranges for the Indic scripts language_agent.py's own
+// _script_profile() recognizes — mirrored here since the TTS socket opens
+// on the frontend, immediately after language detection and before any
+// reply text exists, so this decision can't be made on the backend alone.
+const INDIC_SCRIPT_RANGES = [
+  [0x0600, 0x06ff], // Arabic (Urdu)
+  [0x0900, 0x097f], // Devanagari (Hindi, Marathi)
+  [0x0980, 0x09ff], // Bengali
+  [0x0a00, 0x0a7f], // Gurmukhi (Punjabi)
+  [0x0a80, 0x0aff], // Gujarati
+  [0x0b00, 0x0b7f], // Oriya
+  [0x0b80, 0x0bff], // Tamil
+  [0x0c00, 0x0c7f], // Telugu
+  [0x0c80, 0x0cff], // Kannada
+  [0x0d00, 0x0d7f], // Malayalam
+];
+
+/** Which language's Sarvam voice should speak the reply to `userMessage` —
+ * separate from `detectedLanguage` (still used for the answer TEXT,
+ * unaffected). Real gap confirmed via live TTS->STT round-trip WER testing:
+ * Sarvam's Indic voices handle NATIVE-SCRIPT text cleanly (WER 0.00 across
+ * all 11 testable languages) but badly mangle ROMANIZED (Latin-script) text
+ * even when the target language is genuinely correct (WER 0.75-1.25 on real
+ * romanized Telugu/Hindi/English mixes, "Bro" mispronounced as "Uru" in two
+ * independent test runs). Mirrors agent_core/agents/language_agent.py's
+ * resolve_tts_voice_language() — keep both in sync if the threshold changes. */
+function resolveTtsVoiceLanguage(userMessage, detectedLanguage) {
+  if (!detectedLanguage || detectedLanguage === "en" || detectedLanguage === "unknown") {
+    return "en";
+  }
+  let indicChars = 0;
+  let totalChars = 0;
+  for (const ch of userMessage || "") {
+    const cp = ch.codePointAt(0);
+    const isLatin = (cp >= 0x41 && cp <= 0x5a) || (cp >= 0x61 && cp <= 0x7a);
+    const isIndic = INDIC_SCRIPT_RANGES.some(([lo, hi]) => cp >= lo && cp <= hi);
+    if (isLatin || isIndic) {
+      totalChars += 1;
+      if (isIndic) indicChars += 1;
+    }
+  }
+  if (totalChars === 0) return detectedLanguage; // no script signal either way -- trust detection as-is
+  return indicChars / totalChars > 0.5 ? detectedLanguage : "en";
+}
+
 // The speech-gateway is its own Render service and sleeps independently of
 // the backend — a cold start (or any network hiccup) meant the TTS socket's
 // "open"/"close" events could simply never fire, and with no timeout
@@ -153,7 +198,7 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
   // worrying about connection timing; order is preserved since awaits on the
   // same promise resolve in the order they were registered.
   const openSpeakSession = useCallback(
-    (language) => {
+    (language, userMessage) => {
       // Real bug hit live: the single shared TTSPlayer (`??=`, reused
       // forever) had no guard against a second turn opening while a prior
       // turn's session was still mid-utterance -- two voice-output turns
@@ -165,12 +210,11 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
       setVoiceState(VoiceState.SPEAKING);
       const player = new TTSPlayer();
       ttsPlayerRef.current = player;
-      // "unknown" is a real value `response_language` can carry (low-confidence
-      // detection) — not a valid Sarvam language code. Sending it straight
-      // through as-is made synthesis fail outright ("I'm having trouble with
-      // audio right now"), even though the text itself (e.g. the English
-      // clarifying question) was perfectly speakable in English.
-      const ttsLanguage = language && language !== "unknown" ? language : "en";
+      // Resolves "unknown" (a real value on low-confidence detection --
+      // sending it straight through 422s the TTS call) AND falls back to
+      // English when the user's own message is romanized rather than
+      // native-script -- see resolveTtsVoiceLanguage's own docstring.
+      const ttsLanguage = resolveTtsVoiceLanguage(userMessage, language);
       const socket = new VoiceSocketClient({
         onAudioChunk: (chunk) => {
           player.playChunk(chunk).catch(() => {}); // one bad chunk shouldn't abort the whole reply
@@ -289,7 +333,7 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
               // answer text exists, so voice starts on the very first
               // chunk instead of waiting for the whole reply to also learn
               // what language it turned out to be in.
-              if (isVoiceOutput) speakSession = openSpeakSession(event.response_language);
+              if (isVoiceOutput) speakSession = openSpeakSession(event.response_language, text);
             },
             onTextDelta: (chunk) => {
               appendToMessage(assistantId, chunk);

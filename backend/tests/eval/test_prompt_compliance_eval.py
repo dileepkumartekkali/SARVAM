@@ -31,10 +31,13 @@ from .._language_fixtures import PURE_LANGUAGE_CASES
 
 COMPLIANT_VOICE_REPLY = "Sure, I can help with that today."
 VIOLATING_VOICE_REPLY_MARKDOWN = "**Sure!** Here's a list:\n- one\n- two"
-VIOLATING_VOICE_REPLY_TOO_LONG = "word " * 100
+# Exceeds the 300-word safety-ceiling (raised from the old 90-word brevity
+# cap -- see task_agent._VOICE_MODE_LENGTH_CEILING_WORDS's own comment).
+VIOLATING_VOICE_REPLY_TOO_LONG = "word " * 350
 
 COMPLIANT_TEXT_REPLY = "**Sure!** Here's a short list:\n- one\n- two"
-VIOLATING_TEXT_REPLY_TOO_LONG = "word " * 200
+# Exceeds the 500-word safety ceiling (raised from the old 160-word cap).
+VIOLATING_TEXT_REPLY_TOO_LONG = "word " * 600
 
 
 @pytest.mark.parametrize("text,language", PURE_LANGUAGE_CASES)

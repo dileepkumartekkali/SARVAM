@@ -3,7 +3,7 @@ independence, low-confidence routing, and translation policy."""
 
 import pytest
 
-from agent_core.agents.language_agent import LOW_CONFIDENCE_THRESHOLD, detect_language
+from agent_core.agents.language_agent import LOW_CONFIDENCE_THRESHOLD, detect_language, resolve_tts_voice_language
 from agent_core.agents.translation_policy import decide_translation
 from agent_core.llm_adapter import LLMRouter
 
@@ -117,3 +117,36 @@ async def test_llm_classify_tolerates_real_model_response_shapes(raw_reply):
 
 def test_translation_applied_when_tool_requires_english():
     assert decide_translation("hi", tool_requires_english=True) is True
+
+
+def test_native_script_message_uses_its_own_detected_voice():
+    """Confirmed live (round-trip WER testing): Sarvam's Indic voices
+    handle native-script text cleanly -- WER 0.00 across all 11 testable
+    languages. A native-script message should use its own voice."""
+    assert resolve_tts_voice_language("మీరు ఎలా ఉన్నారు?", "te") == "te"
+
+
+def test_romanized_message_falls_back_to_english_voice():
+    """Real bug hit live: Sarvam's Indic voices badly mangle romanized
+    (Latin-script) text even when the target language is genuinely correct
+    -- WER 0.75-1.25 on real romanized Telugu/Hindi/English mixes, "Bro"
+    mispronounced as "Uru" in two independent test runs. The text-language
+    detection (still Telugu here) is untouched -- only the voice falls
+    back."""
+    assert resolve_tts_voice_language("Bro meeting ki vasthunnava?", "te") == "en"
+
+
+def test_english_target_is_never_second_guessed():
+    assert resolve_tts_voice_language("Hello, how are you?", "en") == "en"
+
+
+def test_unknown_detected_language_resolves_to_english_voice():
+    assert resolve_tts_voice_language("anything at all", "unknown") == "en"
+    assert resolve_tts_voice_language("anything at all", None) == "en"
+
+
+def test_mixed_script_message_uses_the_majority_script():
+    """More Telugu characters than Latin -- should still use the native
+    voice; the threshold is majority, not purity (an occasional embedded
+    English word, e.g. "office", shouldn't force an English voice)."""
+    assert resolve_tts_voice_language("నేను ఈరోజు office కి వెళ్తాను ఎందుకంటే మీటింగ్ ఉంది", "te") == "te"

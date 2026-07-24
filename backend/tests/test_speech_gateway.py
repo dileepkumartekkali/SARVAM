@@ -247,7 +247,7 @@ def test_tts_ws_routes_assamese_to_fallback_via_policy():
     assert isinstance(resolved, AzureFallbackTTSClient)
 
 
-def test_rate_limit_rejection_increments_error_metric():
+async def test_rate_limit_rejection_increments_error_metric():
     from agent_core.observability.metrics import errors_total
     from agent_core.speech_gateway.main import _session_rate_limiter
 
@@ -264,7 +264,7 @@ def test_rate_limit_rejection_increments_error_metric():
     # client host — saturate the limiter for that exact key so the real
     # route rejects the next connection attempt itself.
     for _ in range(_session_rate_limiter._max_requests):
-        _session_rate_limiter.allow("testclient")
+        await _session_rate_limiter.allow("testclient")
 
     client = TestClient(gateway_app)
     try:
@@ -276,7 +276,7 @@ def test_rate_limit_rejection_increments_error_metric():
     assert rate_limit_error_count() == before + 1
 
 
-def test_tts_ws_is_also_rate_limited():
+async def test_tts_ws_is_also_rate_limited():
     """Real gap caught in a pre-deploy sweep: /ws/tts was the only one of
     the three voice-cost websockets that accepted unconditionally, with no
     rate check at all -- a client could open unlimited connections and
@@ -295,7 +295,7 @@ def test_tts_ws_is_also_rate_limited():
     before = rate_limit_error_count()
 
     for _ in range(_session_rate_limiter._max_requests):
-        _session_rate_limiter.allow("testclient")
+        await _session_rate_limiter.allow("testclient")
 
     client = TestClient(gateway_app)
     try:

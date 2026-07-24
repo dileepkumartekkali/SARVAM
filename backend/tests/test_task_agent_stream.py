@@ -8,6 +8,7 @@ self-check failure being logged rather than corrected (no regeneration call
 from agent_core.agents.task_agent import stream_turn
 from agent_core.llm_adapter import LLMRouter
 from agent_core.llm_adapter.base import CompletionResult, LLMProviderError
+from agent_core.observability.metrics import self_check_uncorrected_total
 from agent_core.supervisor.state import Mode, SessionState
 from agent_core.tools.rag_tool import TOOL_VERIFIED_MARKER
 
@@ -446,7 +447,7 @@ async def test_stream_turn_never_leaks_run_turns_internal_apology_as_a_delta():
 
 
 async def test_stream_turn_self_check_failure_is_logged_not_corrected():
-    long_reply = " ".join(["word"] * 200)  # exceeds TEXT_TO_TEXT's 160-word cap -- a deterministic check
+    long_reply = " ".join(["word"] * 600)  # exceeds TEXT_TO_TEXT's 500-word safety ceiling -- a deterministic check
     provider = ScriptedProvider([long_reply])
     router = LLMRouter([provider])
 
@@ -462,6 +463,22 @@ async def test_stream_turn_self_check_failure_is_logged_not_corrected():
     assert provider.call_count == 1
     # The streamed text stands as-is -- not silently swapped for something else.
     assert done["text"] == long_reply
+
+
+async def test_stream_turn_self_check_failure_increments_the_uncorrected_metric():
+    """Architecture gap closed: a streamed turn's self-check violation was
+    previously only visible via a log line -- self_check_uncorrected_total
+    makes "how often does production ship an uncorrected violation" a
+    directly queryable metric instead."""
+    before = self_check_uncorrected_total._value.get()
+    long_reply = " ".join(["word"] * 600)
+    provider = ScriptedProvider([long_reply])
+    router = LLMRouter([provider])
+
+    events = [e async for e in stream_turn(_session(), router, "hi")]
+
+    assert events[-1]["self_check_ok"] is False
+    assert self_check_uncorrected_total._value.get() == before + 1
 
 
 class _SelfCheckReviewerFails:

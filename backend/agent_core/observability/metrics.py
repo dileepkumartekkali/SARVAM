@@ -32,6 +32,16 @@ tts_ttfb_seconds = Histogram(
 )
 
 errors_total = Counter("maav_errors_total", "Errors by stage", ["stage"])
+# Architecture gap closed: stream_turn (the endpoint production traffic
+# actually uses) can't safely correct a self-check violation the way
+# run_turn does -- audio may have already started playing by the time the
+# check completes, so a streamed violation is only ever logged, never
+# fixed. That asymmetry was previously invisible outside a log search; this
+# counter makes "how often does the production path ship an uncorrected
+# violation" a directly queryable number.
+self_check_uncorrected_total = Counter(
+    "maav_self_check_uncorrected_total", "Streamed turns that failed self-check with no correction applied"
+)
 reconnects_total = Counter("maav_reconnects_total", "Client reconnect attempts by stage", ["stage"])
 active_voice_sessions = Counter("maav_voice_sessions_started_total", "Voice sessions started")
 

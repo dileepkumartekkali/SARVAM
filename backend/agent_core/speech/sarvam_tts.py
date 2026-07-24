@@ -135,6 +135,11 @@ class SarvamTTSClient:
             "model": model,
             "output_audio_codec": _OUTPUT_AUDIO_CODEC,
             "speech_sample_rate": _SPEECH_SAMPLE_RATE,
+            # Confirmed live: Sarvam accepts this and returns real audio.
+            # Text normalization (numbers, abbreviations, punctuation) before
+            # synthesis -- a real Twilio-based voice agent comparison project
+            # sets this explicitly; MAAV never had before this.
+            "enable_preprocessing": True,
         }
         if pace is not None:
             data["pace"] = pace
@@ -163,8 +168,13 @@ class SarvamTTSClient:
         # ID from this session ever needs escalating with them directly.
         logger.info("Sarvam TTS config: %s", config_data)
         try:
+            # Switched from "Authorization: Bearer" -- confirmed live that
+            # both schemes work on this account, but this one matches
+            # sarvam_stt.py's own auth (Api-Subscription-Key), so TTS and
+            # STT are no longer internally inconsistent with each other for
+            # no reason.
             async with self._connect(
-                self._ws_url, additional_headers={"Authorization": f"Bearer {self._api_key()}"}
+                self._ws_url, additional_headers={"Api-Subscription-Key": self._api_key()}
             ) as ws:
                 await ws.send(json.dumps({"type": "config", "data": config_data}))
 
