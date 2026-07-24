@@ -10,13 +10,26 @@ enforced once, by the backend, never duplicated here.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from dataclasses import dataclass
 
 import httpx
+from opentelemetry import propagate
+
+from ..llm_adapter._http_common import status_retriable
 
 BACKEND_CHAT_URL = os.environ.get("BACKEND_CHAT_URL", "http://localhost:9000/chat")
 _TIMEOUT_SECONDS = float(os.environ.get("BACKEND_CHAT_TIMEOUT_SECONDS", "20"))
+# Architecture gap closed: a transient failure on this hop (backend cold
+# start, a momentary connection blip, a 502/503 from a rolling deploy) used
+# to go straight to the fixed apology after the full 20s timeout, with no
+# retry at all -- the same class of gap already fixed for the RAG embedding
+# call earlier this session (rag_tool._embed_with_retry). One short retry,
+# not chat_store.record_turn's 3 -- this runs inline on a live voice turn,
+# where the whole point is not adding excessive extra latency.
+_MAX_ATTEMPTS = 2
+_RETRY_DELAY_SECONDS = 0.5
 
 # One pooled client for the process lifetime — constructing it never touches
 # the network, same invariant as the Sarvam clients constructed at import
@@ -71,15 +84,30 @@ async def call_backend_chat(
         "stt_language_hint": language,
         "confirmation_token": confirmation_token,
     }
-    try:
-        response = await _http_client.post(
-            BACKEND_CHAT_URL,
-            json=payload,
-            headers={"Authorization": f"Bearer {auth_token}"},
-        )
-        response.raise_for_status()
-    except httpx.HTTPError as e:
-        raise BackendChatError(str(e)) from e
+    headers = {"Authorization": f"Bearer {auth_token}"}
+    # Architecture gap closed: without this, a voice turn's trace was split
+    # into two disconnected traces at this process boundary (gateway's own
+    # spans, and the backend's own spans, with no shared trace id linking
+    # them) -- exactly the kind of thing that matters when debugging which
+    # layer a slow turn's time actually went to. Standard W3C trace-context
+    # injection, using whatever span is active when this call is made (see
+    # converse.think's own start_span in speech_gateway/main.py).
+    propagate.inject(headers)
+
+    for attempt in range(_MAX_ATTEMPTS):
+        try:
+            response = await _http_client.post(BACKEND_CHAT_URL, json=payload, headers=headers)
+            if response.status_code != 200 and status_retriable(response.status_code) and attempt < _MAX_ATTEMPTS - 1:
+                await asyncio.sleep(_RETRY_DELAY_SECONDS)
+                continue
+            response.raise_for_status()
+            break
+        except (httpx.TimeoutException, httpx.TransportError) as e:
+            if attempt == _MAX_ATTEMPTS - 1:
+                raise BackendChatError(str(e)) from e
+            await asyncio.sleep(_RETRY_DELAY_SECONDS)
+        except httpx.HTTPError as e:
+            raise BackendChatError(str(e)) from e
 
     body = response.json()
     pending = body.get("pending_confirmation")

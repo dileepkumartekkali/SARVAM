@@ -16,7 +16,8 @@ from contextlib import asynccontextmanager
 from typing import Literal
 
 import redis.asyncio as redis
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Response
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, Response
+from opentelemetry import context as otel_context, propagate
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -264,9 +265,31 @@ class ChatResponse(BaseModel):
 @app.post("/chat", response_model=ChatResponse)
 async def chat(
     req: ChatRequest,
+    request: Request,
     background_tasks: BackgroundTasks,
     graph=Depends(get_graph),
     principal: Principal = Depends(get_current_principal),
+) -> ChatResponse:
+    # Architecture gap closed: a voice turn's trace used to be split into
+    # two disconnected traces at the speech_gateway<->backend process
+    # boundary -- gateway's own spans, and this request's own spans, with no
+    # shared trace id linking them. Extracting whatever trace context
+    # backend_client.call_backend_chat injected (W3C traceparent header)
+    # and attaching it here means every start_span() call below nests under
+    # the gateway's own turn span instead of starting a brand new trace.
+    # A no-op for a normal browser client that never sends this header.
+    otel_token = otel_context.attach(propagate.extract(dict(request.headers)))
+    try:
+        return await _chat_impl(req, background_tasks, graph, principal)
+    finally:
+        otel_context.detach(otel_token)
+
+
+async def _chat_impl(
+    req: ChatRequest,
+    background_tasks: BackgroundTasks,
+    graph,
+    principal: Principal,
 ) -> ChatResponse:
     session = SessionState(
         session_id=req.session_id,
@@ -352,7 +375,9 @@ def _sse_event(payload: dict) -> str:
 
 
 @app.post("/chat/stream")
-async def chat_stream(req: ChatRequest, principal: Principal = Depends(get_current_principal)) -> StreamingResponse:
+async def chat_stream(
+    req: ChatRequest, request: Request, principal: Principal = Depends(get_current_principal)
+) -> StreamingResponse:
     """Streams `{"type": "text_delta", "text": ...}` events as sentence-bounded
     chunks become ready (task_agent.stream_turn), then one final `{"type":
     "done", ...}` event shaped like ChatResponse's fields. See stream_turn's
@@ -365,7 +390,7 @@ async def chat_stream(req: ChatRequest, principal: Principal = Depends(get_curre
     if persistence_on and await chat_store.get_conversation(req.conversation_id, principal.subject) is None:
         raise HTTPException(status_code=404, detail="conversation not found")
 
-    async def event_stream():
+    async def _event_stream_inner():
         session = SessionState(
             session_id=req.session_id,
             conversation_id=req.conversation_id,
@@ -498,6 +523,19 @@ async def chat_stream(req: ChatRequest, principal: Principal = Depends(get_curre
                 ),
             }
         )
+
+    async def event_stream():
+        # Same trace-propagation reasoning as /chat above -- attached here
+        # (rather than in the outer chat_stream function) because the
+        # generator's body doesn't actually execute until Starlette starts
+        # iterating it, which happens after chat_stream() itself has
+        # already returned the StreamingResponse object.
+        otel_token = otel_context.attach(propagate.extract(dict(request.headers)))
+        try:
+            async for event in _event_stream_inner():
+                yield event
+        finally:
+            otel_context.detach(otel_token)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
