@@ -565,6 +565,17 @@ async def converse_ws(
                 continue
 
             await websocket.send_json({"type": "transcript_final", "text": event.get("text", "")})
+            # Real gap: run_turn's own duplex.start_thinking() call (which
+            # flips the phase out of LISTENING) only executes once the newly
+            # scheduled task actually runs -- not synchronously here. If
+            # another final transcript is already sitting in event_queue, the
+            # loop's `phase != LISTENING` guard above can read the still-stale
+            # LISTENING phase and spawn a second overlapping turn before the
+            # first one gets to flip it, silently orphaning the first task.
+            # Flipping the phase here, synchronously, closes that window --
+            # start_thinking's own transition_to(THINKING) becomes a no-op
+            # re-entry into the same phase once the task does run.
+            duplex.state.transition_to(SessionPhase.THINKING)
             turn_task = asyncio.ensure_future(run_turn(event["text"]))
     except WebSocketDisconnect:
         pass

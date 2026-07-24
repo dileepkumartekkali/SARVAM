@@ -26,7 +26,15 @@ class SlidingWindowRateLimiter:
         cutoff = now - self._window_seconds
         while hits and hits[0] < cutoff:
             hits.popleft()
+        # Real gap: a key whose deque drains to empty (no requests within the
+        # window) stayed in the dict forever -- every distinct client key
+        # ever seen was a permanent entry, unbounded memory growth on a
+        # long-running process. Drop it here and only re-add on an actual
+        # new hit below, so a key with no recent activity doesn't linger.
+        if not hits:
+            del self._hits[key]
         if len(hits) >= self._max_requests:
             return False
         hits.append(now)
+        self._hits[key] = hits
         return True

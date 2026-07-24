@@ -1,4 +1,4 @@
-import { useCallback, useRef } from "react";
+import { useCallback, useEffect, useRef } from "react";
 import { streamChatMessage } from "../api/chatClient";
 import { MicCapture } from "../api/micCapture";
 import { supabase } from "../api/supabaseClient";
@@ -116,6 +116,13 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
   // the raw teardown `stopListening()` below (which discards the transcript
   // — see `toggle()`). `null` whenever nothing is listening.
   const concludeRef = useRef(null);
+  // Points at the currently in-flight speak session (see `openSpeakSession`),
+  // so a mode change, conversation switch, or unmount can stop its audio —
+  // `null` whenever nothing is actively speaking.
+  const activeSpeakSessionRef = useRef(null);
+  // Aborts the in-flight /chat/stream fetch for the current turn (see
+  // `sendMessage`) — `null` whenever no turn is in flight.
+  const turnAbortControllerRef = useRef(null);
 
   const mode = useAppStore((s) => s.mode);
   const setVoiceState = useAppStore((s) => s.setVoiceState);
@@ -147,8 +154,17 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
   // same promise resolve in the order they were registered.
   const openSpeakSession = useCallback(
     (language) => {
+      // Real bug hit live: the single shared TTSPlayer (`??=`, reused
+      // forever) had no guard against a second turn opening while a prior
+      // turn's session was still mid-utterance -- two voice-output turns
+      // fired close together interleaved both replies' audio through one
+      // queue, and the saved replay WAV mixed/truncated across turns. A
+      // fresh player per turn, plus aborting any still-active previous
+      // session first, keeps only ever one turn's audio live at a time.
+      activeSpeakSessionRef.current?.abort();
       setVoiceState(VoiceState.SPEAKING);
-      const player = (ttsPlayerRef.current ??= new TTSPlayer());
+      const player = new TTSPlayer();
+      ttsPlayerRef.current = player;
       // "unknown" is a real value `response_language` can carry (low-confidence
       // detection) — not a valid Sarvam language code. Sending it straight
       // through as-is made synthesis fail outright ("I'm having trouble with
@@ -193,7 +209,7 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
       // the text reply just appeared with silence. Surfaced once, not per
       // chunk, the first time this is detected.
       let notifiedUnavailable = false;
-      return {
+      const session = {
         async sendChunk(chunk) {
           await opened;
           // Guards against the timeout (not a real "open") having resolved
@@ -213,17 +229,23 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
             await closed;
           }
           setVoiceState(VoiceState.IDLE);
+          if (activeSpeakSessionRef.current === session) activeSpeakSessionRef.current = null;
           return player.finish();
         },
         // Closes without ever speaking anything — for a turn that failed
         // before any real text existed (no sendChunk was ever called), so
         // there's nothing to finish speaking, just a socket to tidy up.
+        // Also the general-purpose "stop this session right now" path used
+        // by mode changes, conversation switches, and unmount.
         abort() {
           socket.closeTTS();
           player.close();
           setVoiceState(VoiceState.IDLE);
+          if (activeSpeakSessionRef.current === session) activeSpeakSessionRef.current = null;
         },
       };
+      activeSpeakSessionRef.current = session;
+      return session;
     },
     [setVoiceState, addMessage]
   );
@@ -234,6 +256,13 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
         const assistantId = addMessage("assistant", "", { streaming: true });
         const isVoiceOutput = mode === Mode.SPEECH_TO_SPEECH || mode === Mode.TEXT_TO_SPEECH;
         let speakSession = null;
+        // Real bug hit live: switching conversations mid-stream had nothing
+        // to stop the old reply's fetch — text deltas kept arriving and
+        // audio kept playing over the newly-opened chat. `reset()` (called
+        // on mode change / conversation switch / logout / unmount) aborts
+        // this so an abandoned turn's stream is actually torn down.
+        const abortController = new AbortController();
+        turnAbortControllerRef.current = abortController;
 
         streamChatMessage(
           {
@@ -243,6 +272,7 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
             conversationId: ids.current.conversationId,
             threadId: ids.current.threadId,
             token,
+            signal: abortController.signal,
           },
           {
             onLanguage: (event) => {
@@ -258,6 +288,7 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
               speakSession?.sendChunk(chunk);
             },
             onDone: async (doneEvent) => {
+              if (turnAbortControllerRef.current === abortController) turnAbortControllerRef.current = null;
               // A failed turn (no LLM provider answered) is not a real reply
               // — never spoken aloud (it wasn't sent as a text_delta, so it
               // never reached TTS) and never saved to history (the backend
@@ -305,6 +336,14 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
             },
           }
         ).catch((err) => {
+          if (turnAbortControllerRef.current === abortController) turnAbortControllerRef.current = null;
+          // A deliberate abort (conversation switch, mode change, unmount —
+          // see `reset()`) is not a failure — the turn was intentionally
+          // abandoned, so nothing about it should be shown as an error.
+          if (err.name === "AbortError") {
+            resolve();
+            return;
+          }
           if (err.status === 401) {
             onUnauthorized?.();
             resolve();
@@ -502,6 +541,16 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
       await mic.start(preCreatedContext);
       micRef.current = mic;
     } catch (err) {
+      // Real bug hit live: `preCreatedContext` is created synchronously in
+      // `toggle()` before this async call even starts (required for mobile
+      // gesture timing — see its own comment). If `mic.start` throws before
+      // it gets far enough to store the context on itself (e.g.
+      // getUserMedia denied), MicCapture never learned about it, so
+      // `stopIdle()` -> `stopListening()` -> `micRef.current?.stop()` is a
+      // no-op (`micRef.current` is still null) and the context leaks. After
+      // ~6 leaked contexts (Chrome's per-page cap), `new AudioContext()`
+      // itself starts throwing and voice stops working entirely until reload.
+      preCreatedContext?.close().catch(() => {});
       stopIdle();
       const denied = err?.name === "NotAllowedError";
       addMessage(
@@ -548,10 +597,35 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
   // stop an in-progress voice session — without this, the orb kept showing
   // "Listening…"/"Speaking…" in the newly-selected mode because nothing
   // reset it. Call on every mode change; a no-op when already idle.
+  //
+  // Real bug hit live: this only ever called `stopListening()` — switching
+  // modes (or conversations, see App.jsx's handleSwitchConversation) while
+  // the assistant was SPEAKING left that reply's audio playing to
+  // completion even though the orb had already flipped to IDLE. It also
+  // left an in-flight /chat/stream fetch running, so a conversation switch
+  // mid-reply kept appending text/audio for a chat the user had already
+  // navigated away from. Now stops all three: mic/STT, active TTS
+  // playback, and the in-flight stream fetch.
   const reset = useCallback(() => {
     stopListening();
+    activeSpeakSessionRef.current?.abort();
+    turnAbortControllerRef.current?.abort();
+    turnAbortControllerRef.current = null;
     setVoiceState(VoiceState.IDLE);
   }, [stopListening, setVoiceState]);
+
+  // Real bug hit live: nothing ever tore this session down on logout or
+  // component unmount — the mic could stay live, TTS could keep playing
+  // indefinitely, and the STT WebSocket could keep reconnecting, all after
+  // the UI that owned them was gone.
+  useEffect(() => {
+    return () => {
+      stopListening();
+      activeSpeakSessionRef.current?.abort();
+      turnAbortControllerRef.current?.abort();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return { toggle, send, reset };
 }

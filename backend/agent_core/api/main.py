@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import uuid
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from typing import Literal
 
@@ -113,10 +114,23 @@ _graph = build_text_graph(
 _STREAM_MAX_HISTORY_MESSAGES = 20
 # Keyed by (user_id, thread_id), not thread_id alone -- see chat_stream's
 # own comment on why (a client-supplied thread_id was never ownership-checked).
-_stream_history: dict[tuple[str, str], list[dict]] = {}
+# Real gap: each entry was capped at _STREAM_MAX_HISTORY_MESSAGES, but the
+# number of distinct (user_id, thread_id) keys was never capped -- a
+# long-running process accumulates one permanent entry per thread ever seen,
+# unbounded memory growth. OrderedDict + evicting the oldest key once over
+# the cap gives it a bound without needing a new dependency.
+_STREAM_HISTORY_MAX_THREADS = 1000
+_stream_history: "OrderedDict[tuple[str, str], list[dict]]" = OrderedDict()
 # One gate for the process, not per-request — a confirmation issued on turn N
 # must still be redeemable on turn N+1 (same reasoning as build_text_graph's).
 _stream_confirmation_gate = ConfirmationGate() if _tool_registry.write_scope_names() else None
+# asyncio.Task only holds a WEAK reference by default -- a task with nothing
+# else referencing it can be garbage-collected (and silently cancelled)
+# mid-write. The non-streaming /chat path avoids this via
+# BackgroundTasks.add_task; this endpoint has no such framework hook (the
+# response is already a StreamingResponse), so a plain module-level set kept
+# alive for the task's lifetime does the same job.
+_background_persistence_tasks: set[asyncio.Task] = set()
 
 
 def get_graph():
@@ -336,6 +350,8 @@ async def chat_stream(req: ChatRequest, principal: Principal = Depends(get_curre
             # where thread_id came from.
             history_key = (principal.subject, req.thread_id)
             history = _stream_history.get(history_key, [])
+            if history_key in _stream_history:
+                _stream_history.move_to_end(history_key)
             final_event = None
             async for event in stream_turn(
                 session,
@@ -376,13 +392,16 @@ async def chat_stream(req: ChatRequest, principal: Principal = Depends(get_curre
                 _stream_history[history_key] = (
                     history + [{"role": "user", "content": req.message}, {"role": "assistant", "content": history_text}]
                 )[-_STREAM_MAX_HISTORY_MESSAGES:]
+                _stream_history.move_to_end(history_key)
+                if len(_stream_history) > _STREAM_HISTORY_MAX_THREADS:
+                    _stream_history.popitem(last=False)
 
         # A failed turn (is_error) is shown to the user but never persisted —
         # it's not a real answer, so it shouldn't clutter their saved history.
         assistant_message_id = None
         if persistence_on and not is_error:
             assistant_message_id = str(uuid.uuid4())
-            asyncio.create_task(
+            persist_task = asyncio.create_task(
                 chat_store.record_turn(
                     req.conversation_id,
                     principal.subject,
@@ -392,6 +411,8 @@ async def chat_stream(req: ChatRequest, principal: Principal = Depends(get_curre
                     assistant_message_id,
                 )
             )
+            _background_persistence_tasks.add(persist_task)
+            persist_task.add_done_callback(_background_persistence_tasks.discard)
 
         yield _sse_event(
             {

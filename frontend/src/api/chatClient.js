@@ -33,7 +33,7 @@ async function fetchWithAuthRetry(url, options, token) {
  * point is not waiting for the full response before doing anything with it.
  */
 export async function streamChatMessage(
-  { message, mode, sessionId, conversationId, threadId, token, sttLanguageHint },
+  { message, mode, sessionId, conversationId, threadId, token, sttLanguageHint, signal },
   { onLanguage, onTextDelta, onDone }
 ) {
   const resp = await fetchWithAuthRetry(
@@ -49,6 +49,11 @@ export async function streamChatMessage(
         mode: mode || "text_to_text",
         stt_language_hint: sttLanguageHint ?? null,
       }),
+      // Optional AbortSignal -- lets a caller (e.g. switching conversations
+      // mid-stream) stop consuming a reply that's no longer wanted, instead
+      // of it continuing to append text/audio to a conversation the user
+      // has already navigated away from.
+      signal,
     },
     token
   );
@@ -74,7 +79,16 @@ export async function streamChatMessage(
       buffer = buffer.slice(boundary + 2);
       for (const line of block.split("\n")) {
         if (!line.startsWith("data:")) continue;
-        const event = JSON.parse(line.slice(5).trim());
+        // A single malformed/partial `data:` line (keepalive payload, an
+        // edge-case flush) used to throw here and abort the whole read loop
+        // -- the rest of a perfectly good reply was silently dropped and the
+        // user just saw a generic "something went wrong" error.
+        let event;
+        try {
+          event = JSON.parse(line.slice(5).trim());
+        } catch {
+          continue;
+        }
         if (event.type === "language") onLanguage?.(event);
         else if (event.type === "text_delta") onTextDelta?.(event.text);
         else if (event.type === "done") onDone?.(event);

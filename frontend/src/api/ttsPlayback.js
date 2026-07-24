@@ -43,6 +43,7 @@ export class TTSPlayer {
     // already normalized by the time it lands here.
     this._capturedChannels = [];
     this._capturedSampleRate = null;
+    this._activeSource = null;
   }
 
   playChunk(arrayBuffer) {
@@ -83,6 +84,7 @@ export class TTSPlayer {
       source.buffer = audioBuffer;
       source.connect(context.destination);
       source.onended = resolve;
+      this._activeSource = source;
       source.start();
     });
   }
@@ -121,6 +123,21 @@ export class TTSPlayer {
   }
 
   close() {
+    // Real bug hit live: if close()/abort() ran while a chunk was still
+    // playing, `onended` never fired (the context closes without the
+    // source ever naturally reaching its end) -- the `_drain` loop's
+    // `await this._playOne(...)` hung forever, and that chunk's own
+    // `playChunk()` promise never settled either. Explicitly stopping the
+    // active source fires `onended` (resolving both) before the context
+    // itself closes. Wrapped in try/catch: stopping a source that already
+    // ended naturally is a harmless no-op in every real browser, but not
+    // guaranteed by spec, and a stray exception here shouldn't block cleanup.
+    try {
+      this._activeSource?.stop();
+    } catch {
+      // already stopped/ended -- nothing to do
+    }
+    this._activeSource = null;
     this._context?.close();
     this._context = null;
     this._queue = [];

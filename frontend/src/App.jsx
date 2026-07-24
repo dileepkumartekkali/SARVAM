@@ -55,8 +55,13 @@ export default function App() {
     conversationId: crypto.randomUUID(),
     threadId: crypto.randomUUID(),
   });
+  // Tracks which user's conversations the load-effect below has already run
+  // for, so a Supabase token refresh (same user, new token string) doesn't
+  // re-trigger it — see that effect's own comment.
+  const loadedForUserIdRef = useRef(null);
 
   function handleLogout() {
+    resetVoice(); // stop mic/TTS/in-flight stream before the session that owns them goes away
     supabase.auth.signOut();
     logout();
   }
@@ -104,8 +109,21 @@ export default function App() {
   // the frontend's perspective (see chatClient.js). The composer stays
   // disabled (conversationReady=false) until this settles, one way or
   // another — see the note on conversationReady above.
+  //
+  // Real bug hit live: this used to be keyed on [token] alone, which also
+  // re-fires on Supabase's periodic TOKEN_REFRESHED event (same user, brand
+  // new access_token string) -- roughly hourly, or on tab refocus, the user
+  // was bounced back to their most-recently-active conversation and any
+  // in-progress streaming reply on screen was wiped. Gating on the actual
+  // user id (which a token refresh never changes) makes this run once per
+  // real login instead of once per token.
   useEffect(() => {
-    if (!token) return;
+    if (!token) {
+      loadedForUserIdRef.current = null;
+      return;
+    }
+    if (loadedForUserIdRef.current === user?.id) return;
+    loadedForUserIdRef.current = user?.id;
     setConversationReady(false);
     (async () => {
       try {
@@ -149,6 +167,13 @@ export default function App() {
   const handleSwitchConversation = useCallback(
     async (id) => {
       if (id === activeConversationId) return;
+      // Real bug hit live: switching conversations while a reply was still
+      // streaming orphaned it — text deltas kept targeting the old
+      // (about-to-be-replaced) message id and, in voice modes, the previous
+      // conversation's audio kept playing over the newly-opened chat.
+      // `resetVoice()` aborts the in-flight stream fetch and any active TTS
+      // playback before the switch.
+      resetVoice();
       activateConversation(id);
       try {
         loadMessages(await fetchConversationMessages(token, id));
@@ -157,7 +182,7 @@ export default function App() {
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [activeConversationId, token, loadMessages]
+    [activeConversationId, token, loadMessages, resetVoice]
   );
 
   const handleNewConversation = useCallback(async () => {
