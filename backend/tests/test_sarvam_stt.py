@@ -83,6 +83,25 @@ async def test_error_event_is_translated():
     assert translated == {"type": "error", "reason": "Invalid request"}
 
 
+async def test_error_event_falls_back_to_other_field_names():
+    """Real bug hit live: a mobile-only "Speech recognition failed: unknown
+    Sarvam STT error" report means Sarvam sent an error event whose actual
+    reason lived under a key other than "error" -- checking a few other
+    plausible field names gives a real chance of surfacing the actual
+    reason instead of "unknown" every time the field name differs."""
+    for key in ("message", "reason", "detail"):
+        event = {"type": "error", "data": {key: "some real reason"}}
+        assert SarvamSTTClient._translate_event(event) == {"type": "error", "reason": "some real reason"}
+
+
+async def test_error_event_with_no_recognized_field_stays_honest():
+    """No known field present at all -- still reports "unknown" rather than
+    guessing, but now logs the full raw event so the NEXT occurrence is
+    diagnosable instead of a repeat mystery."""
+    event = {"type": "error", "data": {"some_other_key": "whatever"}}
+    assert SarvamSTTClient._translate_event(event) == {"type": "error", "reason": "unknown Sarvam STT error"}
+
+
 async def test_end_speech_vad_signal_is_translated():
     event = {"type": "events", "data": {"signal_type": "END_SPEECH"}}
     assert SarvamSTTClient._translate_event(event) == {"type": "vad", "signal": "speech_end"}

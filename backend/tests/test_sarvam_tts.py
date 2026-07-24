@@ -23,6 +23,10 @@ _FINAL_EVENT = json.dumps({"type": "event", "data": {"event_type": "final", "mes
 async def test_synthesize_reuses_one_socket_for_all_chunks(monkeypatch):
     """One `connect()` call for the whole utterance — not one per chunk."""
     monkeypatch.setenv("SARVAM_API_KEY", "test-key")
+    # See test_config_message_uses_real_sarvam_field_names's own comment.
+    import agent_core.speech.sarvam_tts as sarvam_tts_module
+    monkeypatch.setattr(sarvam_tts_module, "_INITIAL_RESPONSE_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(sarvam_tts_module, "_CHUNK_IDLE_TIMEOUT_SECONDS", 0.05)
     connect_calls = []
 
     incoming = [
@@ -50,12 +54,57 @@ async def test_synthesize_reuses_one_socket_for_all_chunks(monkeypatch):
     assert text_messages[0]["data"]["text"] == "Hello"
 
 
+async def test_all_chunks_audio_arrives_even_when_an_early_final_fires_first(monkeypatch):
+    """Real bug hit live in this fix's own first attempt, confirmed with the
+    real Sarvam API: `final` fires per FLUSHED BATCH, not once for the whole
+    reply. The old (buggy) fix used `send_done.is_set()` alone as the "no
+    more chunks are coming" signal -- but when chunks are sent close
+    together (the common case once the LLM has already produced several
+    sentences), the send task can finish -- and set send_done -- almost
+    immediately after only the FIRST chunk's own final arrives, well before
+    the SECOND and THIRD chunks' own audio/final ever show up. That
+    incorrectly ended the whole reply after only the first sentence's
+    audio, silently dropping the rest -- confirmed live: three sentences
+    sent, only the first one's audio (matching its exact byte size) came
+    back, in ~5s, instead of all three in ~4s once fixed. Counting flushes
+    sent vs. finals actually received (not just whether sending is done)
+    is what prevents this."""
+    monkeypatch.setenv("SARVAM_API_KEY", "test-key")
+    import agent_core.speech.sarvam_tts as sarvam_tts_module
+    monkeypatch.setattr(sarvam_tts_module, "_INITIAL_RESPONSE_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(sarvam_tts_module, "_CHUNK_IDLE_TIMEOUT_SECONDS", 0.05)
+
+    incoming = [
+        _audio_event(b"AUDIO_1"),
+        _FINAL_EVENT,  # arrives for chunk 1 -- must NOT be treated as "the whole reply is done"
+        _audio_event(b"AUDIO_2"),
+        _FINAL_EVENT,
+        _audio_event(b"AUDIO_3"),
+        _FINAL_EVENT,  # only THIS one, once 3 chunks have been flushed, is really the end
+    ]
+    ws = FakeWSConnection(incoming=incoming)
+    client = SarvamTTSClient(connect=fake_connect_returning(ws))
+
+    audio = [a async for a in client.synthesize(_texts("one", "two", "three"), language="en")]
+
+    assert audio == [b"AUDIO_1", b"AUDIO_2", b"AUDIO_3"]
+
+
 async def test_config_message_uses_real_sarvam_field_names(monkeypatch):
     """Regression test for the real bug found in production testing: the
     original protocol used flat `language`/`voice` fields and a `convert`
     type — Sarvam rejected it with a 422. The real API needs a nested `data`
     object with `target_language_code` and a required `speaker`."""
     monkeypatch.setenv("SARVAM_API_KEY", "test-key")
+    # FakeWSConnection's static incoming queue can be consumed by the receive
+    # loop before the concurrent send task has run at all -- impossible on a
+    # real socket (Sarvam can't respond before we've sent anything), but it
+    # means this test's single pre-queued event doesn't reflect real send
+    # timing. Shrinking these timeouts keeps the test fast regardless of
+    # which order asyncio happens to schedule the two coroutines in.
+    import agent_core.speech.sarvam_tts as sarvam_tts_module
+    monkeypatch.setattr(sarvam_tts_module, "_INITIAL_RESPONSE_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(sarvam_tts_module, "_CHUNK_IDLE_TIMEOUT_SECONDS", 0.05)
     ws = FakeWSConnection(incoming=[_FINAL_EVENT])
     client = SarvamTTSClient(connect=fake_connect_returning(ws))
 
@@ -78,6 +127,12 @@ async def test_config_requests_raw_pcm_not_the_mp3_default(monkeypatch):
     linear16 (raw PCM) instead means every chunk decodes cleanly on its
     own, matching how it's actually played."""
     monkeypatch.setenv("SARVAM_API_KEY", "test-key")
+    # See test_config_message_uses_real_sarvam_field_names's own comment on
+    # why these are shrunk -- a FakeWSConnection timing artifact, not a
+    # production concern (impossible on a real socket).
+    import agent_core.speech.sarvam_tts as sarvam_tts_module
+    monkeypatch.setattr(sarvam_tts_module, "_INITIAL_RESPONSE_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(sarvam_tts_module, "_CHUNK_IDLE_TIMEOUT_SECONDS", 0.05)
     ws = FakeWSConnection(incoming=[_FINAL_EVENT])
     client = SarvamTTSClient(connect=fake_connect_returning(ws))
 

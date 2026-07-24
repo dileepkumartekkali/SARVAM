@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import os
 from typing import AsyncIterator, Callable
 from urllib.parse import urlencode
@@ -38,6 +39,8 @@ import websockets
 import websockets.exceptions
 
 from .clients import STTEvent, STTMode
+
+logger = logging.getLogger("agent_core.speech")
 
 _DEFAULT_WS_URL = "wss://api.sarvam.ai/speech-to-text/ws"
 _DEFAULT_REST_URL = "https://api.sarvam.ai/speech-to-text"
@@ -175,7 +178,18 @@ class SarvamSTTClient:
                 return {"type": "vad", "signal": "speech_end"}
             return None
         if event_type == "error":
-            return {"type": "error", "reason": data.get("error", "unknown Sarvam STT error")}
+            # Real gap: this only ever checked `data["error"]`. A live
+            # "Speech recognition failed: unknown Sarvam STT error" report
+            # (mobile only, not reproduced on desktop in this session) means
+            # Sarvam sent an error event whose actual reason lived under a
+            # different key than the one this code checks -- logging the
+            # full raw event (never audio bytes, just this small dict) makes
+            # the next occurrence diagnosable instead of another "unknown."
+            reason = data.get("error") or data.get("message") or data.get("reason") or data.get("detail")
+            if reason is None:
+                logger.warning("Sarvam STT error event with no recognized reason field: %s", event)
+                reason = "unknown Sarvam STT error"
+            return {"type": "error", "reason": reason}
         return None
 
     @staticmethod
