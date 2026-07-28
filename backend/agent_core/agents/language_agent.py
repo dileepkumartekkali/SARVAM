@@ -132,6 +132,63 @@ def disallowed_script_in(text: str) -> str | None:
     return None
 
 
+# Reverse of _SCRIPT_TO_LANG plus the two ambiguous-script languages
+# (_AMBIGUOUS_SCRIPTS resolves hi/mr and bn/as by lexical marker, not
+# codepoint alone, so they're not in _SCRIPT_TO_LANG's 1:1 mapping).
+_LANG_TO_SCRIPT: dict[str, str] = {
+    "ur": "arabic", "hi": "devanagari", "mr": "devanagari", "bn": "bengali", "as": "bengali",
+    "pa": "gurmukhi", "gu": "gujarati", "or": "oriya", "ta": "tamil", "te": "telugu",
+    "kn": "kannada", "ml": "malayalam",
+}
+
+# Below this many script-bearing characters, a script-ratio judgment is too
+# noisy to trust (a two-word reply gives no reliable signal either way) --
+# same "don't guess on a weak signal" principle as LOW_CONFIDENCE_THRESHOLD.
+_SCRIPT_MISMATCH_MIN_CHARS = 8
+# How dominant a foreign script must be, as a fraction of all script-bearing
+# characters, before it's treated as a real language miss rather than an
+# occasional embedded word (a company name, a technical term).
+_SCRIPT_MISMATCH_RATIO = 0.3
+
+
+def target_language_mismatch(text: str, target_language: str | None, is_code_mixed: bool) -> bool:
+    """True if `text`'s dominant script is clearly not the target language's.
+
+    Live-confirmed real bug, twice: an English-target turn answered in
+    Telugu-English code-mixed once, and entirely in Telugu another time --
+    self-check caught both AFTER the wrong-language text had already
+    streamed to the client (turn_trace: "VIOLATION: draft is not in the
+    target language English, it is in Telugu-English code-mixed..."). This
+    generalizes `disallowed_script_in` (which only catches scripts no
+    supported language ever uses, e.g. Chinese) to catch a supported-but-
+    WRONG Indic script too, using the same deterministic script-profile
+    logic `detect_language`/`resolve_tts_voice_language` already rely on --
+    no extra network call.
+
+    Conservative by design, same reasoning as `resolve_tts_voice_language`'s
+    own majority-script threshold: an occasional loanword or proper noun
+    never trips this, only a clear script-majority miss does.
+    """
+    if not target_language or target_language == "unknown":
+        return False
+    profile = _script_profile(text)
+    total = sum(profile.values())
+    if total < _SCRIPT_MISMATCH_MIN_CHARS:
+        return False
+    if target_language == "en":
+        # English never legitimately code-mixes with an Indic script (only
+        # the reverse -- an Indic target mixing in English -- is a
+        # documented, allowed style). Any Indic script at a real majority
+        # share means the reply drifted to a different language entirely.
+        indic_total = total - profile.get("latin", 0)
+        return indic_total / total > _SCRIPT_MISMATCH_RATIO
+    expected = {_LANG_TO_SCRIPT.get(target_language)}
+    if is_code_mixed:
+        expected.add("latin")
+    dominant_script, dominant_count = max(profile.items(), key=lambda kv: kv[1])
+    return dominant_script not in expected and dominant_count / total > 0.5
+
+
 _HI_MARKERS = {"है", "हैं", "आप", "कैसे", "नहीं", "क्या"}
 _MR_MARKERS = {"आहे", "आहात", "तुम्ही", "काय", "नाही", "मी"}
 _ASSAMESE_ONLY_CHARS = ("ৰ", "ৱ")  # ৰ, ৱ — absent from standard Bengali

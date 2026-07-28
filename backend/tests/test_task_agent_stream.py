@@ -481,6 +481,29 @@ async def test_stream_turn_self_check_failure_increments_the_uncorrected_metric(
     assert self_check_uncorrected_total._value.get() == before + 1
 
 
+async def test_stream_turn_catches_wrong_indic_language_before_it_reaches_the_client():
+    """Regression test for a real live incident (turn_trace: "VIOLATION:
+    draft is not in the target language English, it is in Telugu-English
+    code-mixed") -- an English-target turn answered mostly in Telugu. Unlike
+    the disallowed-script (CJK) case, Telugu is a perfectly legitimate
+    script for OTHER targets, so this needs target_language_mismatch, not
+    just disallowed_script_in, to catch it before it streams to the client."""
+    wrong_language_reply = (
+        "డేటా నుండి నేర్చుకుంటాయి మరియు కాలక్రమేణా వాటి ఖచ్చితత్వాన్ని మెరుగుపరుస్తాయి ఇది చాలా ఉపయోగకరంగా ఉంటుంది"
+    )
+    provider = ScriptedProvider([wrong_language_reply, "This is the corrected English reply.", "OK"])
+    router = LLMRouter([provider])
+    session = _session().model_copy(update={"response_language": "en", "is_code_mixed": False})
+
+    events = [e async for e in stream_turn(session, router, "what is inference")]
+
+    text_deltas = [e["text"] for e in events if e["type"] == "text_delta"]
+    combined = "".join(text_deltas)
+    assert "డేటా" not in combined
+    assert "corrected English reply" in combined
+    assert provider.call_count == 3
+
+
 async def test_stream_turn_catches_disallowed_script_before_it_reaches_the_client():
     """Live-confirmed real bug (turn_trace: "VIOLATION: response is in
     Chinese, not the target language English") -- self-check caught a wrong-

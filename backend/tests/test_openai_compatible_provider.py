@@ -175,6 +175,56 @@ async def test_truncated_reasoning_complete_with_tools_raises_retriable_error(mo
     assert exc_info.value.retriable is True
 
 
+async def test_tool_use_failed_400_is_retriable(monkeypatch):
+    """Live-confirmed real bug: Groq returned 400 "Failed to call a
+    function. Please adjust your prompt." with error.code == "tool_use_failed"
+    when Llama-3.3-70b generated malformed native function-call syntax for a
+    RAG-triggering query -- the whole turn died with "I'm having trouble
+    getting an answer right now" instead of falling back to the next
+    configured provider. This is the model's own generation failing, not a
+    real client error, so it must be retriable like a 5xx -- unlike a plain
+    400 (still correctly non-retriable, see test_auth_failure_is_not_retriable
+    -- er, that's 401; a malformed-request 400 stays non-retriable below)."""
+    monkeypatch.setenv("GROK_API_KEY", "test-key")
+    body = json.dumps(
+        {
+            "error": {
+                "message": "Failed to call a function. Please adjust your prompt. See 'failed_generation' for more details.",
+                "type": "invalid_request_error",
+                "code": "tool_use_failed",
+                "failed_generation": '<function=search_company_knowledge {"query": "M Touch Labs CEO"}</function>',
+            }
+        }
+    )
+    transport = httpx.MockTransport(lambda request: httpx.Response(400, text=body))
+    provider = OpenAICompatibleProvider(
+        name="grok", base_url="https://api.groq.com/openai/v1", model="llama-3.3-70b-versatile",
+        api_key_env="GROK_API_KEY", transport=transport,
+    )
+
+    with pytest.raises(LLMProviderError) as exc_info:
+        await provider.complete_with_tools([{"role": "user", "content": "hi"}])
+
+    assert exc_info.value.retriable is True
+
+
+async def test_plain_malformed_request_400_stays_non_retriable(monkeypatch):
+    """A genuinely malformed request (not the tool_use_failed case above)
+    must stay the caller's own fault to see, not silently papered over by a
+    fallback to another provider."""
+    monkeypatch.setenv("GROK_API_KEY", "test-key")
+    transport = httpx.MockTransport(lambda request: httpx.Response(400, text="bad request schema"))
+    provider = OpenAICompatibleProvider(
+        name="grok", base_url="https://api.groq.com/openai/v1", model="llama-3.3-70b-versatile",
+        api_key_env="GROK_API_KEY", transport=transport,
+    )
+
+    with pytest.raises(LLMProviderError) as exc_info:
+        await provider.complete_with_tools([{"role": "user", "content": "hi"}])
+
+    assert exc_info.value.retriable is False
+
+
 async def test_extra_body_merged_into_request(monkeypatch):
     """Sarvam's `reasoning_effort` has no generic equivalent — passed through
     as an opaque provider-specific field, not hardcoded into the shared

@@ -27,7 +27,7 @@ from ..security.output_validation import sanitize_llm_output, stream_safe_saniti
 from ..speech.chunker import chunk_stream
 from ..supervisor.state import Mode, SessionState
 from .cancellation import CancellationToken, TurnCancelled
-from .language_agent import LANGUAGE_NAMES, disallowed_script_in
+from .language_agent import LANGUAGE_NAMES, disallowed_script_in, target_language_mismatch
 from .prompt_templates import load_template
 from .untrusted import wrap_untrusted
 
@@ -609,6 +609,10 @@ async def stream_turn(
                 accumulated.append(chunk)
                 if not yielded_anything:
                     script_violation = disallowed_script_in(chunk)
+                    if not script_violation and target_language_mismatch(
+                        "".join(accumulated), session.response_language, session.is_code_mixed
+                    ):
+                        script_violation = "target-language mismatch"
                     if script_violation:
                         break
                 marker_tail += chunk

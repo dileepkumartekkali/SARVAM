@@ -9,6 +9,7 @@ from agent_core.agents.language_agent import (
     disallowed_script_in,
     is_low_confidence,
     resolve_tts_voice_language,
+    target_language_mismatch,
 )
 from agent_core.agents.translation_policy import decide_translation
 from agent_core.llm_adapter import LLMRouter
@@ -178,3 +179,55 @@ def test_disallowed_script_ignores_every_supported_language_and_code_mixing():
     assert disallowed_script_in("Hello, how are you?") is None
     assert disallowed_script_in("నేను ఈరోజు office కి వెళ్తాను") is None
     assert disallowed_script_in("यह हिंदी में एक वाक्य है") is None
+
+
+def test_target_language_mismatch_catches_telugu_reply_for_english_target():
+    """Regression test for a real live incident: an English-target turn
+    answered entirely in Telugu (turn_trace showed the reply for "what is
+    inference" came back as native Telugu text with zero English)."""
+    telugu_reply = (
+        "Inference అంటే ఒక నిర్ధారణ లేదా ఒక ముగింపు, ఇది మనకు తెలిసినవిషయాల ఆధారంగా చేసే అనుమితి."
+    )
+    assert target_language_mismatch(telugu_reply, "en", is_code_mixed=False) is True
+
+
+def test_target_language_mismatch_catches_telugu_english_codemix_for_english_target():
+    """Regression test for the other live incident: turn_trace logged
+    "VIOLATION: draft is not in the target language English, it is in
+    Telugu-English code-mixed" -- English never legitimately code-mixes
+    with an Indic script (only the reverse direction is a real style)."""
+    reply = (
+        "Machine learning models డేటా నుండి నేర్చుకుంటాయి మరియు కాలక్రమేణా వాటి ఖచ్చితత్వాన్ని "
+        "మెరుగుపరుస్తాయి, ఇది చాలా ఉపయోగకరంగా ఉంటుంది."
+    )
+    assert target_language_mismatch(reply, "en", is_code_mixed=False) is True
+
+
+def test_target_language_mismatch_allows_a_genuine_english_reply():
+    assert target_language_mismatch("Hello, how can I help you today?", "en", is_code_mixed=False) is False
+
+
+def test_target_language_mismatch_allows_legitimate_indic_english_codemixing():
+    """The one direction that IS a real, documented style: an Indic target
+    naturally code-mixed with English words."""
+    reply = "నేను ఈరోజు office కి వెళ్తాను ఎందుకంటే మీటింగ్ ఉంది"
+    assert target_language_mismatch(reply, "te", is_code_mixed=True) is False
+
+
+def test_target_language_mismatch_catches_wrong_indic_script_for_indic_target():
+    hindi_reply = "यह एक हिंदी वाक्य है जो तेलुगु के बजाय आया"
+    assert target_language_mismatch(hindi_reply, "te", is_code_mixed=False) is True
+
+
+def test_target_language_mismatch_ignores_a_short_ambiguous_reply():
+    """Too little script signal to safely judge -- avoids a false positive
+    on a short reply like "42" or "Yes." with no real language content."""
+    assert target_language_mismatch("42", "te", is_code_mixed=False) is False
+    assert target_language_mismatch("OK", "hi", is_code_mixed=False) is False
+
+
+def test_target_language_mismatch_tolerates_an_occasional_loanword():
+    """An occasional embedded proper noun/loanword must not trip this --
+    only a clear script-majority miss does."""
+    reply = "మీ ప్రశ్నకు సమాధానం ఇక్కడ ఉంది. MTouch Labs వారి సేవలు చాలా బాగున్నాయి."
+    assert target_language_mismatch(reply, "te", is_code_mixed=True) is False

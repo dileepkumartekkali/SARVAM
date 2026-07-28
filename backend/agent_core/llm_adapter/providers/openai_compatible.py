@@ -22,7 +22,7 @@ from typing import AsyncIterator, Sequence
 
 import httpx
 
-from .._http_common import status_retriable
+from .._http_common import status_retriable, tool_call_error_retriable
 from .._sse import iter_sse_data
 from ..base import CompletionResult, LLMProviderError, Message, ToolCall, ToolDefinition
 
@@ -219,7 +219,7 @@ class OpenAICompatibleProvider:
                 if resp.status_code != 200:
                     raise LLMProviderError(
                         f"{self.name} returned {resp.status_code}: {resp.text}",
-                        retriable=status_retriable(resp.status_code),
+                        retriable=tool_call_error_retriable(resp.status_code, resp.text),
                         provider=self.name,
                     )
                 choices = resp.json().get("choices") or []
