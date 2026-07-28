@@ -288,6 +288,58 @@ def _romanized_keyword_detect(text: str) -> LanguageDetectionResult | None:
     return None
 
 
+# Deliberately SEPARATE from _ROMANIZED_MARKERS above (input-side language
+# detection), not reused -- confirmed live that reusing it broke input
+# detection for related languages sharing common romanized words with
+# Hindi in casual speech ("hai"/"nahi" are everyday Punjabi/Urdu words too,
+# not Hindi-exclusive): a Punjabi test sentence got misdetected as Hindi
+# once these were added to the shared dict. Fine as an OUTPUT-side "this
+# clearly is not the target language" signal (any of these being wrong is
+# still wrong regardless of which exact Hindi-belt language it really is),
+# but a poor discriminator for "which exact language is this" on the input
+# side, which needs real precision between Hindi/Punjabi/Urdu.
+#
+# Real bug hit live: an English-target turn answered "mTouch Labs ka motive
+# hai technology ko accessible... karne ke liye..." -- romanized Hindi,
+# entirely in Latin characters. disallowed_script_in and
+# target_language_mismatch (both Unicode-script-profile based) saw nothing
+# wrong, since romanized text carries no script signal at all -- only
+# self-check's own LLM reviewer caught it ("contains code-mixed Hindi
+# phrases"), too late in the streamed path to correct. ponytail: only Hindi
+# covered today (the one confirmed case) -- extend per-language as further
+# live cases surface.
+_OUTPUT_ROMANIZED_MARKERS: dict[str, set[str]] = {
+    "hi": {
+        "hai", "hain", "karne", "karna", "kaise", "kyunki", "matlab",
+        "chahiye", "wala", "wali", "unka", "iska", "uska", "nahi", "aur",
+        "bilkul", "shayad", "lekin",
+    },
+}
+
+# 2, not 1 -- a single marker word could coincidentally be a rare loanword
+# or false match; a real romanized-language violation reliably has several
+# (a whole sentence's worth of function words), same reasoning as
+# target_language_mismatch's own minimum-signal threshold.
+_ROMANIZED_LANGUAGE_MISMATCH_MIN_HITS = 2
+
+
+def romanized_language_in(text: str, exclude_language: str | None = None) -> str | None:
+    """Language code of a DIFFERENT romanized language detected in `text`
+    (via _OUTPUT_ROMANIZED_MARKERS, separate from input-side detection --
+    see its own comment on why), or None. `exclude_language` is the target
+    -- code-mixing the target's OWN language romanized with English is a
+    legitimate, documented style (see task_agent._expected_script), not a
+    violation."""
+    lowered = text.lower()
+    for lang, markers in _OUTPUT_ROMANIZED_MARKERS.items():
+        if lang == exclude_language:
+            continue
+        hits = sum(1 for m in markers if m in lowered)
+        if hits >= _ROMANIZED_LANGUAGE_MISMATCH_MIN_HITS:
+            return lang
+    return None
+
+
 # --- Plain English (Latin script, no other signal) --------------------------
 
 _EN_STOPWORDS = {"the", "is", "are", "you", "how", "what", "please", "thanks", "hello", "hi", "hey", "yes", "no"}

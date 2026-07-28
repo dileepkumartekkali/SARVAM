@@ -120,6 +120,36 @@ async def test_run_turn_corrects_a_verbatim_wrong_language_rag_fact():
     assert result.self_check_ok is True
 
 
+async def test_run_turn_corrects_a_romanized_wrong_language_reply():
+    """Regression test for a real live incident: "what is the motive of
+    mtouch labs" (English-target) came back as "mTouch Labs ka motive hai
+    technology ko accessible... karne ke liye..." -- romanized Hindi in
+    plain Latin script, invisible to disallowed_script_in/
+    target_language_mismatch (both Unicode-script-profile based, and this
+    reply has no non-Latin characters at all). romanized_language_in closes
+    this gap for run_turn's own deterministic pre-check too."""
+    wrong_language_reply = (
+        "mTouch Labs ka motive hai technology ko accessible aur impactful banane ka, "
+        "aur businesses ko automate karne, decision-making improve karne, aur predictive "
+        "insights unlock karne ke liye scalable AI aur ML solutions deliver karne ka."
+    )
+    corrected_english = "mTouch Labs' motive is to make technology accessible and impactful."
+    provider = ScriptedProvider([wrong_language_reply, corrected_english, "OK"])
+    router = LLMRouter([provider])
+
+    async def fake_search(query: str) -> str:
+        return "[About]\nmTouch Labs' motive is to make technology accessible and impactful."
+
+    session = _session().model_copy(update={"response_language": "en", "is_code_mixed": False})
+    result = await run_turn(
+        session, router, "what is the motive of mtouch labs",
+        tools={"search_company_knowledge": fake_search},
+    )
+
+    assert result.text == corrected_english
+    assert result.self_check_ok is True
+
+
 async def test_forced_retrieval_registry_generalizes_to_a_second_topic(monkeypatch):
     """Architecture gap closed: forced retrieval used to be one hardcoded
     keyword+tool pair. _FORCED_RETRIEVAL_REGISTRY is a list of (keyword,

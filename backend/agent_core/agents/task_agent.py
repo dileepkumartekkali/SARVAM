@@ -27,7 +27,12 @@ from ..security.output_validation import sanitize_llm_output, stream_safe_saniti
 from ..speech.chunker import chunk_stream
 from ..supervisor.state import Mode, SessionState
 from .cancellation import CancellationToken, TurnCancelled
-from .language_agent import LANGUAGE_NAMES, disallowed_script_in, target_language_mismatch
+from .language_agent import (
+    LANGUAGE_NAMES,
+    disallowed_script_in,
+    romanized_language_in,
+    target_language_mismatch,
+)
 from .prompt_templates import load_template
 from .untrusted import wrap_untrusted
 
@@ -208,12 +213,15 @@ def _turn_directive(session: SessionState, user_message: str) -> str:
     return " ".join(d for d in (_language_directive(session, user_message), _voice_brevity_directive(session)) if d)
 
 
+_ROMANIZED_VIOLATION_PREFIX = "romanized:"
+
+
 def _describe_script_violation(script_violation: str, session: SessionState) -> str:
     """Human-actionable wording for a disallowed_script_in/
-    target_language_mismatch hit, used as the `{reason}` fed into
-    _CORRECTION_REQUEST_TEMPLATE — shared by stream_turn and run_turn so
-    both give the model the same explicit, concrete feedback rather than a
-    cryptic internal label."""
+    target_language_mismatch/romanized_language_in hit, used as the
+    `{reason}` fed into _CORRECTION_REQUEST_TEMPLATE — shared by
+    stream_turn and run_turn so both give the model the same explicit,
+    concrete feedback rather than a cryptic internal label."""
     target_name = (
         LANGUAGE_NAMES.get(session.response_language, session.response_language)
         if session.response_language
@@ -221,6 +229,14 @@ def _describe_script_violation(script_violation: str, session: SessionState) -> 
     )
     if script_violation == "target-language mismatch":
         return f"the draft was not in {target_name} (the target language) — wrong language/script entirely"
+    if script_violation.startswith(_ROMANIZED_VIOLATION_PREFIX):
+        wrong_code = script_violation[len(_ROMANIZED_VIOLATION_PREFIX):]
+        wrong_name = LANGUAGE_NAMES.get(wrong_code, wrong_code)
+        return (
+            f"the draft contains romanized {wrong_name} vocabulary (written in Latin letters, e.g. "
+            f"common {wrong_name} function words), but the target language is {target_name} — rewrite "
+            f"entirely in {target_name}, not {wrong_name}, even though both can be written in Latin script"
+        )
     return f"the draft used {script_violation} script, which no supported language ever uses"
 
 
@@ -630,11 +646,18 @@ async def stream_turn(
             async for chunk in chunk_stream(_sniff_and_forward(raw_stream, known_tool_names)):
                 accumulated.append(chunk)
                 if not yielded_anything:
+                    accumulated_so_far = "".join(accumulated)
                     script_violation = disallowed_script_in(chunk)
                     if not script_violation and target_language_mismatch(
-                        "".join(accumulated), session.response_language, session.is_code_mixed
+                        accumulated_so_far, session.response_language, session.is_code_mixed
                     ):
                         script_violation = "target-language mismatch"
+                    if not script_violation:
+                        wrong_romanized_lang = romanized_language_in(
+                            accumulated_so_far, exclude_language=session.response_language
+                        )
+                        if wrong_romanized_lang:
+                            script_violation = f"{_ROMANIZED_VIOLATION_PREFIX}{wrong_romanized_lang}"
                     if script_violation:
                         break
                 marker_tail += chunk
@@ -1038,10 +1061,15 @@ async def run_turn(
             # not a second, separate correction path, which would double up
             # provider calls unpredictably against a mechanism already
             # proven to work.
-            script_violation = disallowed_script_in(draft) or (
-                "target-language mismatch"
-                if target_language_mismatch(draft, session.response_language, session.is_code_mixed)
-                else None
+            _wrong_romanized_lang = romanized_language_in(draft, exclude_language=session.response_language)
+            script_violation = (
+                disallowed_script_in(draft)
+                or (
+                    "target-language mismatch"
+                    if target_language_mismatch(draft, session.response_language, session.is_code_mixed)
+                    else None
+                )
+                or (f"{_ROMANIZED_VIOLATION_PREFIX}{_wrong_romanized_lang}" if _wrong_romanized_lang else None)
             )
             if script_violation:
                 self_check_ok, self_check_reason = False, _describe_script_violation(script_violation, session)

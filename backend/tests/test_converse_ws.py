@@ -231,15 +231,18 @@ def test_speaks_using_the_turns_own_detected_language_not_the_session_initial_on
     Telugu, would have that Telugu text spoken with the Hindi voice
     configuration instead of Telugu.
 
-    Transcript is native-script Telugu (not "hello") so this test isn't
-    confounded by resolve_tts_voice_language's OWN romanized-text safety net
-    (see test_falls_back_to_english_voice_for_a_romanized_transcript below,
-    which tests that behavior on its own)."""
+    Reply text is native-script Telugu (not an English placeholder) so this
+    test isn't confounded by resolve_tts_voice_language's OWN romanized-text
+    safety net (see test_falls_back_to_english_voice_for_a_romanized_reply
+    below, which tests that behavior on its own) -- voice selection is
+    based on the REPLY text actually being synthesized, not the user's own
+    (possibly differently-scripted) question; see that check's own comment
+    in speech_gateway/main.py for the real live bug this fixed."""
     stt = ScriptedGatewaySTT(events_per_frame=[[{"type": "transcript", "text": "మీరు ఎలా ఉన్నారు", "is_final": True, "confidence": 0.9}]])
     tts = RecordingGatewayTTS()
 
     async def fake_chat_caller(**kwargs):
-        return BackendChatReply(text="Reply in Telugu", response_language="te")
+        return BackendChatReply(text="మీరు బాగున్నారా అని అడిగారు", response_language="te")
 
     _override(
         {
@@ -266,23 +269,24 @@ def test_speaks_using_the_turns_own_detected_language_not_the_session_initial_on
     assert tts.languages_used == ["te"]
 
 
-def test_falls_back_to_english_voice_for_a_romanized_transcript():
+def test_falls_back_to_english_voice_for_a_romanized_reply():
     """Real bug hit live (round-trip WER testing, this session): Sarvam's
     Indic voices badly mangle ROMANIZED (Latin-script) text even when the
     target language is genuinely correct -- WER 0.75-1.25 on real romanized
     Telugu/Hindi/English mixes, including a specific word ("Bro")
-    mispronounced twice independently. detect_language correctly identifies
-    "Bro meeting ki vasthunnava?" as Telugu (code-mixed) -- but speaking it
-    with a Telugu VOICE is exactly the failure mode confirmed live. The
-    reply TEXT must still be in the detected language; only the VOICE
-    should fall back to English."""
+    mispronounced twice independently. Voice selection checks the REPLY
+    TEXT actually being synthesized (not the user's own question, a
+    fixed live bug -- see speech_gateway/main.py's own comment): if the
+    reply itself comes back romanized despite a Telugu target, the VOICE
+    must still fall back to English, even though the reply TEXT stays
+    exactly as the backend returned it (untouched)."""
     stt = ScriptedGatewaySTT(
         events_per_frame=[[{"type": "transcript", "text": "Bro meeting ki vasthunnava?", "is_final": True, "confidence": 0.9}]]
     )
     tts = RecordingGatewayTTS()
 
     async def fake_chat_caller(**kwargs):
-        return BackendChatReply(text="Reply text stays in Telugu, unaffected", response_language="te")
+        return BackendChatReply(text="Bro meeting ki vasthunnav, kotha update ledu ika", response_language="te")
 
     _override(
         {
@@ -303,8 +307,8 @@ def test_falls_back_to_english_voice_for_a_romanized_transcript():
     finally:
         gateway_app.dependency_overrides.clear()
 
-    assert "Reply text stays in Telugu" in assistant_msg["text"]
-    assert tts.languages_used == ["en"]
+    assert "Bro meeting ki vasthunnav" in assistant_msg["text"]  # reply TEXT is untouched
+    assert tts.languages_used == ["en"]  # only the VOICE falls back
 
 
 def test_unknown_detected_language_falls_back_to_english_for_tts_not_sent_raw():

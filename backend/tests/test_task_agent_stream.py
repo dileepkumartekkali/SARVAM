@@ -512,6 +512,38 @@ async def test_stream_turn_catches_wrong_indic_language_before_it_reaches_the_cl
     assert any("English" in str(m.get("content", "")) for m in correction_call_messages)
 
 
+async def test_stream_turn_catches_romanized_wrong_language_before_it_reaches_the_client():
+    """Regression test for a real live incident: "what is the motive of
+    mtouch labs" (English-target) came back as "mTouch Labs ka motive hai
+    technology ko accessible... karne ke liye..." -- romanized Hindi,
+    entirely in Latin script. turn_trace showed self-check caught it
+    ("VIOLATION: draft is not in target language English, contains
+    code-mixed Hindi phrases") but no "disallowed_script_detected" field --
+    proof the existing script-profile-based guard (disallowed_script_in/
+    target_language_mismatch) is structurally blind to a wrong language
+    written in Latin characters. romanized_language_in closes this gap."""
+    wrong_language_reply = (
+        "mTouch Labs ka motive hai technology ko accessible aur impactful banane ka, "
+        "aur businesses ko automate karne, decision-making improve karne, aur predictive "
+        "insights unlock karne ke liye scalable AI aur ML solutions deliver karne ka."
+    )
+    provider = ScriptedProvider(
+        [wrong_language_reply, "mTouch Labs' motive is to make technology accessible and impactful.", "OK"]
+    )
+    router = LLMRouter([provider])
+    session = _session().model_copy(update={"response_language": "en", "is_code_mixed": False})
+
+    events = [e async for e in stream_turn(session, router, "what is the motive of mtouch labs")]
+
+    text_deltas = [e["text"] for e in events if e["type"] == "text_delta"]
+    combined = "".join(text_deltas)
+    assert "karne" not in combined
+    assert "accessible and impactful" in combined
+    assert provider.call_count == 3
+    correction_call_messages = provider.messages_by_call[1]
+    assert any("Hindi" in str(m.get("content", "")) for m in correction_call_messages)
+
+
 async def test_stream_turn_catches_disallowed_script_before_it_reaches_the_client():
     """Live-confirmed real bug (turn_trace: "VIOLATION: response is in
     Chinese, not the target language English") -- self-check caught a wrong-

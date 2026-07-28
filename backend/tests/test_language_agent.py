@@ -9,6 +9,7 @@ from agent_core.agents.language_agent import (
     disallowed_script_in,
     is_low_confidence,
     resolve_tts_voice_language,
+    romanized_language_in,
     target_language_mismatch,
 )
 from agent_core.agents.translation_policy import decide_translation
@@ -231,3 +232,37 @@ def test_target_language_mismatch_tolerates_an_occasional_loanword():
     only a clear script-majority miss does."""
     reply = "మీ ప్రశ్నకు సమాధానం ఇక్కడ ఉంది. MTouch Labs వారి సేవలు చాలా బాగున్నాయి."
     assert target_language_mismatch(reply, "te", is_code_mixed=True) is False
+
+
+def test_romanized_language_in_catches_real_live_incident():
+    """Regression test for a real live incident: an English-target turn
+    answered "mTouch Labs ka motive hai technology ko accessible... karne
+    ke liye..." -- romanized Hindi, entirely in Latin script, invisible to
+    both disallowed_script_in and target_language_mismatch (neither sees
+    anything but Latin characters)."""
+    reply = (
+        "mTouch Labs ka motive hai technology ko accessible aur impactful banane ka, "
+        "aur businesses ko automate karne, decision-making improve karne, aur predictive "
+        "insights unlock karne ke liye scalable AI aur ML solutions deliver karne ka."
+    )
+    assert disallowed_script_in(reply) is None
+    assert target_language_mismatch(reply, "en", is_code_mixed=False) is False
+    assert romanized_language_in(reply, exclude_language="en") == "hi"
+
+
+def test_romanized_language_in_ignores_plain_english():
+    assert romanized_language_in("Hello, how can I help you today?", exclude_language="en") is None
+
+
+def test_romanized_language_in_allows_the_targets_own_romanized_style():
+    """The one legitimate case: the target language itself, romanized and
+    code-mixed with English (task_agent._expected_script's own documented
+    style) -- must not be flagged as a mismatch against itself."""
+    reply = "Mera matlab hai ki yeh feature bahut useful hai aur aap ise turant use kar sakte hain."
+    assert romanized_language_in(reply, exclude_language="hi") is None
+
+
+def test_romanized_language_in_requires_more_than_one_marker():
+    """A single, possibly-coincidental marker word must not trip this --
+    only a real multi-word signal does."""
+    assert romanized_language_in("The word hai can appear in odd contexts.", exclude_language="en") is None
