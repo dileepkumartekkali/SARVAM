@@ -41,6 +41,19 @@ def validate_wav(data: bytes) -> AudioValidationResult:
     return AudioValidationResult(True)
 
 
+def is_silent_frame(data: bytes) -> bool:
+    """True if every sample in this PCM16LE frame is exactly zero.
+
+    Real ambient noise (even a silent room, even a muted-sounding recording)
+    essentially never rounds to exact zero on every sample — a frame this
+    "clean" means the audio path delivering it isn't carrying a real signal
+    at all (dead mic track, OS/driver-level mute, wrong device). Distinct
+    from validate_pcm_frame's shape/size checks: a frame can be perfectly
+    well-formed PCM16 and still be pure silence.
+    """
+    return not any(data)
+
+
 def validate_pcm_frame(data: bytes, *, sample_rate: int) -> AudioValidationResult:
     """Validates a single raw PCM16 frame: correct sample rate, even byte
     count (whole 16-bit samples, never a truncated sample), and a size that's

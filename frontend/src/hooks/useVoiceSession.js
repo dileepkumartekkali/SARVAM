@@ -551,7 +551,11 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
           if (event.type === "error") {
             // Never fail silently — a bare flip back to "Tap to speak" with
             // no explanation reads as "speech to text is not working" with
-            // nothing to act on.
+            // nothing to act on. Logging the full raw event (not just the
+            // toast text) here too -- the gateway now server-logs every STT
+            // error as well (sarvam_stt.py), so the same failure is visible
+            // from either side without needing to reproduce it twice.
+            console.error("[voice] STT error event:", event);
             stopIdle();
             addMessage("assistant", `Speech recognition failed: ${event.reason || "unknown error"}. Please try again.`);
           }

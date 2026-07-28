@@ -43,7 +43,7 @@ from ..observability.metrics import (
 from ..observability.tracing import init_tracing, start_span
 from ..security.pii import mask_pii
 from ..security.rate_limit import SlidingWindowRateLimiter
-from ..speech.audio_validation import validate_pcm_frame
+from ..speech.audio_validation import is_silent_frame, validate_pcm_frame
 from ..speech.chunker import chunk_stream
 from ..speech.clients import SpeechSTTClient, SpeechTTSClient, STTMode
 from ..speech.fallback_tts import AzureFallbackTTSClient
@@ -216,8 +216,17 @@ async def stt_ws(websocket: WebSocket, stt_client: SpeechSTTClient = Depends(get
     audio_buffer: deque[bytes] = deque(maxlen=_STT_AUDIO_BUFFER_FRAMES)
     turn_start = time.monotonic()
     first_transcript_seen = False
+    # Real gap: the gateway had zero visibility into whether the audio it
+    # forwarded to Sarvam was ever real. A dead client mic (all-zero PCM)
+    # is perfectly VALID shape/size per validate_pcm_frame, so it sailed
+    # through silently -- this client never got a "your mic isn't sending
+    # anything" signal from the one place actually positioned to see the
+    # raw bytes across the whole session, not just one frame at a time.
+    frame_count = 0
+    silent_frame_count = 0
 
     async def client_audio():
+        nonlocal frame_count, silent_frame_count
         while True:
             try:
                 # Same dead-client leak class fixed in tts_ws: a live mic
@@ -237,6 +246,9 @@ async def stt_ws(websocket: WebSocket, stt_client: SpeechSTTClient = Depends(get
             if not result.ok:
                 await websocket.send_json({"type": "error", "reason": result.reason})
                 continue
+            frame_count += 1
+            if is_silent_frame(frame):
+                silent_frame_count += 1
             audio_buffer.append(frame)
             yield frame
 
@@ -264,6 +276,7 @@ async def stt_ws(websocket: WebSocket, stt_client: SpeechSTTClient = Depends(get
                     logger.debug("transcript event: %s", mask_pii(event["text"]))
                 if event.get("type") == "error":
                     errors_total.labels(stage="stt").inc()
+                    logger.warning("stt_ws error event forwarded to client: %s", event.get("reason"))
                 try:
                     await websocket.send_json(event)
                 except RuntimeError:
@@ -275,6 +288,21 @@ async def stt_ws(websocket: WebSocket, stt_client: SpeechSTTClient = Depends(get
     except WebSocketDisconnect:
         pass
     finally:
+        # Only place with visibility into the whole session's raw audio —
+        # this is what makes "client mic wasn't producing anything" (vs. a
+        # real STT/network failure) diagnosable from Render logs alone, no
+        # client-side console access needed.
+        if frame_count > 0 and silent_frame_count == frame_count:
+            logger.warning(
+                "stt_ws session client_key=%s: all %d received audio frames were pure silence "
+                "(all-zero PCM) -- the client's mic track was not carrying a real signal",
+                client_key, frame_count,
+            )
+        elif frame_count > 0 and silent_frame_count / frame_count > 0.5:
+            logger.warning(
+                "stt_ws session client_key=%s: %d/%d received audio frames were pure silence",
+                client_key, silent_frame_count, frame_count,
+            )
         active_websocket_connections.labels(kind="stt").dec()
         await _safe_close(websocket)
 
@@ -475,8 +503,14 @@ async def converse_ws(
     # backend_client.call_backend_chat's docstring.
     pending_confirmation_token: str | None = None
     turn_task: asyncio.Task | None = None
+    # See stt_ws's own comment on frame_count/silent_frame_count -- same gap,
+    # same fix, for the full-duplex path (mobile speech-to-speech traffic
+    # goes through here, not stt_ws, if the client uses that mode).
+    frame_count = 0
+    silent_frame_count = 0
 
     async def client_audio():
+        nonlocal frame_count, silent_frame_count
         while True:
             try:
                 # Same dead-client leak class fixed in stt_ws/tts_ws (see
@@ -496,6 +530,9 @@ async def converse_ws(
             if frame is None:
                 continue
             if validate_pcm_frame(frame, sample_rate=sample_rate).ok:
+                frame_count += 1
+                if is_silent_frame(frame):
+                    silent_frame_count += 1
                 yield frame
 
     # STT runs as its own long-lived task feeding a queue, rather than being
@@ -513,6 +550,7 @@ async def converse_ws(
             pass
         except Exception as e:  # noqa: BLE001 — surfaced to the client as a stream error, not a crash
             errors_total.labels(stage="stt").inc()
+            logger.warning("converse_ws stt_pump error: %s", e)
             await event_queue.put({"type": "error", "reason": str(e)})
         await event_queue.put({"type": "_stt_stream_ended"})
 
@@ -657,5 +695,16 @@ async def converse_ws(
         # bare `.cancel()`.
         await DuplexSession._cancel_and_await(stt_task)
         await DuplexSession._cancel_and_await(turn_task)
+        if frame_count > 0 and silent_frame_count == frame_count:
+            logger.warning(
+                "converse_ws session client_key=%s: all %d received audio frames were pure silence "
+                "(all-zero PCM) -- the client's mic track was not carrying a real signal",
+                client_key, frame_count,
+            )
+        elif frame_count > 0 and silent_frame_count / frame_count > 0.5:
+            logger.warning(
+                "converse_ws session client_key=%s: %d/%d received audio frames were pure silence",
+                client_key, silent_frame_count, frame_count,
+            )
         active_websocket_connections.labels(kind="converse").dec()
         await _safe_close(websocket)

@@ -90,6 +90,19 @@ export class MicCapture {
     // occurrence of the all-zero-RMS bug immediately diagnosable instead of
     // guessed at.
     console.info("[voice] negotiated track settings:", track?.getSettings?.());
+    // MediaStreamTrack.muted is the browser's OWN verdict on whether this
+    // track is currently delivering real data -- distinct from the app's
+    // own RMS-based dead-track guess, and the one signal that can tell an
+    // OS/driver-level mute (this fires) apart from "the track looks live
+    // but every sample happens to be zero for some other reason" (this
+    // does NOT fire, since the browser itself still thinks data is
+    // flowing). Never logged before this -- exactly the missing piece
+    // needed to tell those two cases apart from a live report.
+    console.info("[voice] track.muted at negotiation:", track?.muted, "readyState:", track?.readyState);
+    if (track) {
+      track.onmute = () => console.warn("[voice] track muted mid-session (browser/OS signaled no more data):", this.deviceLabel);
+      track.onunmute = () => console.info("[voice] track unmuted mid-session:", this.deviceLabel);
+    }
     // Use the pre-created context (gesture-safe on mobile) or create one now
     // as fallback for desktop where timing is not restricted.
     this._context = preCreatedContext || new AudioContext();

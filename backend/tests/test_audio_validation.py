@@ -1,4 +1,4 @@
-from agent_core.speech.audio_validation import validate_pcm_frame, validate_wav
+from agent_core.speech.audio_validation import is_silent_frame, validate_pcm_frame, validate_wav
 
 
 def test_valid_wav_header_accepted():
@@ -47,3 +47,13 @@ def test_oversized_frame_rejected():
     huge = b"\x00\x00" * 100_000
     result = validate_pcm_frame(huge, sample_rate=16000)
     assert result.ok is False
+
+
+def test_all_zero_frame_is_silent():
+    assert is_silent_frame(b"\x00\x00" * 512) is True
+
+
+def test_frame_with_any_nonzero_byte_is_not_silent():
+    """Real quiet-but-live audio never rounds every single sample to exactly
+    zero -- one nonzero byte anywhere is enough to call it real signal."""
+    assert is_silent_frame(b"\x00\x00" * 511 + b"\x01\x00") is False

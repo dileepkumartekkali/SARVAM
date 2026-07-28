@@ -189,6 +189,14 @@ class SarvamSTTClient:
             if reason is None:
                 logger.warning("Sarvam STT error event with no recognized reason field: %s", event)
                 reason = "unknown Sarvam STT error"
+            else:
+                # Previously only logged when the reason couldn't be found at
+                # all -- a real, named Sarvam error (e.g. quota, bad audio
+                # format, auth) never showed up in Render logs even once,
+                # only in the client's own toast. Every STT error is now
+                # server-logged so a live incident is diagnosable from
+                # Render alone, without needing the reporter's own console.
+                logger.warning("Sarvam STT error event: %s", event)
             return {"type": "error", "reason": reason}
         return None
 
