@@ -6,6 +6,7 @@ import pytest
 from agent_core.agents.language_agent import (
     LOW_CONFIDENCE_THRESHOLD,
     detect_language,
+    disallowed_script_in,
     is_low_confidence,
     resolve_tts_voice_language,
 )
@@ -164,3 +165,16 @@ def test_is_low_confidence_matches_the_threshold():
     assert is_low_confidence(LOW_CONFIDENCE_THRESHOLD - 0.01) is True
     assert is_low_confidence(LOW_CONFIDENCE_THRESHOLD) is False
     assert is_low_confidence(None) is True  # no confidence at all -- treat as low, not high
+
+
+def test_disallowed_script_detects_chinese():
+    """Regression test for a real live incident: self-check logged
+    "VIOLATION: response is in Chinese, not the target language English" --
+    none of the 13 supported languages ever legitimately use CJK script."""
+    assert disallowed_script_in("你好，这是中文回复。") == "Chinese"
+
+
+def test_disallowed_script_ignores_every_supported_language_and_code_mixing():
+    assert disallowed_script_in("Hello, how are you?") is None
+    assert disallowed_script_in("నేను ఈరోజు office కి వెళ్తాను") is None
+    assert disallowed_script_in("यह हिंदी में एक वाक्य है") is None

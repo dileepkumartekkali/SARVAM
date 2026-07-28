@@ -27,7 +27,7 @@ from ..security.output_validation import sanitize_llm_output, stream_safe_saniti
 from ..speech.chunker import chunk_stream
 from ..supervisor.state import Mode, SessionState
 from .cancellation import CancellationToken, TurnCancelled
-from .language_agent import LANGUAGE_NAMES
+from .language_agent import LANGUAGE_NAMES, disallowed_script_in
 from .prompt_templates import load_template
 from .untrusted import wrap_untrusted
 
@@ -587,14 +587,35 @@ async def stream_turn(
         # generalizes the same holdback approach to all three defenses.
         marker_tail = ""
         leaked = False
+        # Live-confirmed real bug (turn_trace: "VIOLATION: response is in
+        # Chinese, not the target language English"): self-check catches a
+        # wrong-language generation, but only AFTER it has already streamed
+        # to the client -- too late to matter. None of the 13 supported
+        # languages ever legitimately produce CJK/Japanese/Korean/Cyrillic
+        # script, so its presence is checked deterministically, per chunk,
+        # for free. Only actionable before `yielded_anything` flips True --
+        # once real output has reached the client over SSE it can't be
+        # recalled, same constraint stream_with_fallback's own fallback
+        # window is built around. This is exactly the common case in
+        # practice: a wrong-language generation is wrong from the first
+        # token, not just the tail, and the chunker's own first-chunk cap
+        # (5-10 words) means very little (often nothing) has gone out by the
+        # time this can catch it.
+        script_violation: str | None = None
+        yielded_anything = False
         try:
             raw_stream = router.stream_with_fallback(messages, system=system_prompt)
             async for chunk in chunk_stream(_sniff_and_forward(raw_stream, known_tool_names)):
                 accumulated.append(chunk)
+                if not yielded_anything:
+                    script_violation = disallowed_script_in(chunk)
+                    if script_violation:
+                        break
                 marker_tail += chunk
                 safe_text, marker_tail, leak_detected = stream_safe_sanitize(marker_tail)
                 if safe_text:
                     yield {"type": "text_delta", "text": safe_text}
+                    yielded_anything = True
                 if leak_detected:
                     # Already-yielded chunks before this point can't be
                     # recalled over SSE, but nothing further of the leak
@@ -602,7 +623,7 @@ async def stream_turn(
                     # response entirely (never mind self-check on it below).
                     leaked = True
                     break
-            if not leaked:
+            if not leaked and not script_violation:
                 # Stream ended normally -- nothing more can arrive to
                 # complete a marker/tag spanning the tail, so whatever's
                 # left is safe to flush as-is (no more holdback needed).
@@ -612,6 +633,7 @@ async def stream_turn(
                     leaked = True
                 if final_flush:
                     yield {"type": "text_delta", "text": final_flush}
+                    yielded_anything = True
         except _ToolCallDetected:
             result = await run_turn(
                 session,
@@ -659,6 +681,22 @@ async def stream_turn(
                 "error": True,
             }
             return
+
+        if script_violation:
+            logger.info(
+                "turn_trace",
+                extra={
+                    "prompt_version": version_id,
+                    "streamed": True,
+                    "disallowed_script_detected": script_violation,
+                },
+            )
+            try:
+                corrected = await router.complete_with_fallback(messages, system=system_prompt)
+            except LLMProviderError:
+                corrected = LLM_UNAVAILABLE_APOLOGY
+            accumulated = [corrected]
+            yield {"type": "text_delta", "text": corrected}
 
         if leaked:
             # Skip self-check entirely -- there's no benefit to reviewing a

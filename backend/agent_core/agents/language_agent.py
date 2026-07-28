@@ -105,6 +105,33 @@ _SCRIPT_TO_LANG = {
     "malayalam": "ml",
 }
 
+# None of the 13 supported languages use any of these scripts -- CJK
+# (Chinese), Hiragana/Katakana (Japanese), Hangul (Korean), or Cyrillic
+# (Russian). Their presence in a generated reply is unambiguous proof of a
+# wrong-language generation, confirmed live: self-check caught a real Grok
+# reply that came back entirely in Chinese for an English-target turn (turn
+# trace: "VIOLATION: response is in Chinese, not the target language
+# English."). Deliberately narrow and safe from false positives on
+# legitimate code-mixed output, unlike a general "wrong language" guess --
+# none of these scripts are ever a real part of any supported reply.
+_DISALLOWED_SCRIPT_RANGES: list[tuple[int, int, str]] = [
+    (0x4E00, 0x9FFF, "Chinese"),
+    (0x3040, 0x30FF, "Japanese"),
+    (0xAC00, 0xD7A3, "Korean"),
+    (0x0400, 0x04FF, "Cyrillic"),
+]
+
+
+def disallowed_script_in(text: str) -> str | None:
+    """Name of the first disallowed script found in `text`, or None."""
+    for ch in text:
+        cp = ord(ch)
+        for lo, hi, name in _DISALLOWED_SCRIPT_RANGES:
+            if lo <= cp <= hi:
+                return name
+    return None
+
+
 _HI_MARKERS = {"है", "हैं", "आप", "कैसे", "नहीं", "क्या"}
 _MR_MARKERS = {"आहे", "आहात", "तुम्ही", "काय", "नाही", "मी"}
 _ASSAMESE_ONLY_CHARS = ("ৰ", "ৱ")  # ৰ, ৱ — absent from standard Bengali

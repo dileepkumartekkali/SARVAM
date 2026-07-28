@@ -481,6 +481,30 @@ async def test_stream_turn_self_check_failure_increments_the_uncorrected_metric(
     assert self_check_uncorrected_total._value.get() == before + 1
 
 
+async def test_stream_turn_catches_disallowed_script_before_it_reaches_the_client():
+    """Live-confirmed real bug (turn_trace: "VIOLATION: response is in
+    Chinese, not the target language English") -- self-check caught a wrong-
+    language Grok reply, but only after it had already streamed to the
+    client. No supported language ever legitimately produces CJK script, so
+    it's checked per-chunk BEFORE anything is yielded; a violation on the
+    very first chunk (wrong from the first token, the common case) triggers
+    one corrective regeneration the client never sees the broken version of."""
+    provider = ScriptedProvider(["你好，这是中文回复。", "Hello, this is the corrected English reply.", "OK"])
+    router = LLMRouter([provider])
+
+    events = [e async for e in stream_turn(_session(), router, "hello")]
+
+    text_deltas = [e["text"] for e in events if e["type"] == "text_delta"]
+    combined = "".join(text_deltas)
+    assert "你好" not in combined
+    assert "corrected English reply" in combined
+    done = events[-1]
+    assert done["type"] == "done"
+    # 3 calls: the (aborted) Chinese generation, the corrective regeneration,
+    # and self-check's own reviewer call on the corrected text.
+    assert provider.call_count == 3
+
+
 class _SelfCheckReviewerFails:
     """Main generation succeeds with a short, compliant reply (so the
     deterministic checks in _self_check don't short-circuit before ever
