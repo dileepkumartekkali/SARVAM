@@ -140,7 +140,31 @@ class SarvamSTTClient:
                                     {recv_task, send_task}, return_when=asyncio.FIRST_COMPLETED
                                 )
                                 if not recv_task.done():
+                                    # Real bug hit live: `.cancel()` only
+                                    # REQUESTS cancellation -- it doesn't
+                                    # synchronously guarantee ws.recv() has
+                                    # actually unwound before this loop
+                                    # `continue`s and (on the very next
+                                    # iteration, now that send_task.done() is
+                                    # true) issues ANOTHER ws.recv() call.
+                                    # Two recv() calls briefly in flight on
+                                    # the same socket is exactly what
+                                    # websockets' own guard rejects:
+                                    # "cannot call recv while another
+                                    # coroutine is already running recv or
+                                    # recv_streaming" -- confirmed live,
+                                    # forcing the STT REST fallback (which
+                                    # then also failed on the buffered
+                                    # audio's format, dropping the whole
+                                    # utterance). Awaiting the cancellation
+                                    # here guarantees the old recv() has
+                                    # actually stopped before a new one ever
+                                    # starts.
                                     recv_task.cancel()
+                                    try:
+                                        await recv_task
+                                    except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                                        pass
                                     continue  # pump just ended — re-enter in bounded mode
                                 raw = recv_task.result()
                         except asyncio.TimeoutError:

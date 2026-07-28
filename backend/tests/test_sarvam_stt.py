@@ -109,6 +109,33 @@ async def test_error_event_with_no_recognized_field_stays_honest():
     assert SarvamSTTClient._translate_event(event) == {"type": "error", "reason": "unknown Sarvam STT error"}
 
 
+async def test_cancelled_recv_is_awaited_before_reentering_bounded_mode(monkeypatch):
+    """Real bug hit live: "stt_ws error event forwarded to client: cannot
+    call recv while another coroutine is already running recv or
+    recv_streaming; REST fallback also failed: ..." -- once the audio
+    source ends, a still-pending recv() raced against the finished
+    send_task was cancelled with a bare `.cancel()`, then the loop
+    immediately re-entered bounded mode and called ws.recv() again --
+    `.cancel()` only REQUESTS cancellation, it doesn't guarantee the old
+    recv() has actually unwound first. Two recv() calls briefly in flight
+    on the same socket is exactly what websockets' own single-reader guard
+    rejects, dropping the whole utterance (REST fallback then also failed
+    on the buffered audio's format). FakeWSConnection's own recv() now
+    raises that same RuntimeError under the old (buggy) ordering --
+    proving the fix (awaiting the cancellation) actually prevents it."""
+    monkeypatch.setenv("SARVAM_API_KEY", "test-key")
+    ws = FakeWSConnection(incoming=[])  # recv() blocks forever — "quiet but open" socket
+
+    async def one_frame():
+        yield b"\x00\x01" * 512  # audio source ends immediately after one frame
+
+    client = SarvamSTTClient(connect=fake_connect_returning(ws))
+
+    events = [e async for e in client.stream(one_frame(), codec="pcm_s16le", sample_rate=16000)]
+
+    assert events == []  # no transcript arrived, but no RuntimeError either
+
+
 async def test_end_speech_vad_signal_is_translated():
     event = {"type": "events", "data": {"signal_type": "END_SPEECH"}}
     assert SarvamSTTClient._translate_event(event) == {"type": "vad", "signal": "speech_end"}
