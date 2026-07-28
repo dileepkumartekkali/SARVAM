@@ -19,9 +19,17 @@ from .providers.openai_compatible import OpenAICompatibleProvider
 # officially support most of the 13 Indic languages (only Hindi among them,
 # per Meta's published list), so non-Hindi Indic-language replies fall
 # through to Sarvam (the actually-multilingual model) whenever Grok's own
-# call fails. Gemini kept at the end (Google Cloud quota is confirmed dead
-# — every model 404s/429s) in case it's ever fixed.
-_DEFAULT_ORDER = "grok,sarvam,gemini,claude,gpt"
+# call fails.
+#
+# "gemini" and "claude" removed from the default order (live-confirmed real
+# bug, not just dead weight): ANTHROPIC_API_KEY is not set in this
+# deployment, and a missing-key error is (correctly) non-retriable -- so
+# any turn that fell through as far as "claude" in the chain STOPPED
+# THERE, never even reaching "gpt" next in line, even if gpt has a working
+# key. Gemini's own quota is separately confirmed dead (every model
+# 404s/429s) and was only adding wasted latency in the same cascade. Add
+# either back via LLM_PROVIDER_ORDER once genuinely configured/fixed.
+_DEFAULT_ORDER = "grok,sarvam,gpt"
 
 
 def _build_provider(name: str) -> LLMProvider:

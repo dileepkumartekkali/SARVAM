@@ -159,8 +159,33 @@ class LLMRouter:
     a non-retriable error is surfaced immediately, no fallback.
     """
 
+    # Live-confirmed real bug: a single turn needing several separate LLM
+    # calls (draft generation, tool dispatch, self-check, correction retry)
+    # had EACH call independently retry the primary provider from scratch --
+    # even when that exact provider had returned 429 moments earlier in the
+    # very same turn. Every one of those repeat attempts wasted a call (and
+    # further counted against an already-exhausted rate limit, worsening the
+    # NEXT call's odds too) before falling through to the same fallback
+    # provider it was always going to reach anyway. Remembering a recent
+    # 429 per provider, for a short cooldown, skips straight to the next
+    # provider on every call made during that window.
+    _RATE_LIMIT_COOLDOWN_SECONDS = 30.0
+
     def __init__(self, providers: Sequence[LLMProvider]):
         self._providers = list(providers)
+        self._rate_limited_until: dict[str, float] = {}
+
+    def _usable_providers(self) -> list[LLMProvider]:
+        now = time.monotonic()
+        usable = [p for p in self._providers if self._rate_limited_until.get(p.name, 0.0) <= now]
+        # Never end up with nothing to try just because every provider
+        # happens to be in cooldown at once -- a real (if unlikely) attempt
+        # beats refusing outright.
+        return usable or self._providers
+
+    def _note_error(self, provider_name: str, error: LLMProviderError) -> None:
+        if "429" in str(error):
+            self._rate_limited_until[provider_name] = time.monotonic() + self._RATE_LIMIT_COOLDOWN_SECONDS
 
     async def complete_with_fallback(
         self,
@@ -173,7 +198,7 @@ class LLMRouter:
         last_error: LLMProviderError | None = None
         start = time.monotonic()
         with start_span("llm_router", "llm.complete"):
-            for provider in self._providers:
+            for provider in self._usable_providers():
                 try:
                     result = await provider.complete(
                         messages, system=system, max_tokens=max_tokens, temperature=temperature
@@ -184,6 +209,7 @@ class LLMRouter:
                     if not e.retriable:
                         errors_total.labels(stage="llm").inc()
                         raise
+                    self._note_error(provider.name, e)
                     last_error = e
                     continue
             errors_total.labels(stage="llm").inc()
@@ -210,7 +236,7 @@ class LLMRouter:
         last_error: LLMProviderError | None = None
         start = time.monotonic()
         with start_span("llm_router", "llm.complete_with_tools"):
-            for provider in self._providers:
+            for provider in self._usable_providers():
                 try:
                     result = await provider.complete_with_tools(
                         messages, system=system, tools=tools, max_tokens=max_tokens, temperature=temperature
@@ -221,6 +247,7 @@ class LLMRouter:
                     if not e.retriable:
                         errors_total.labels(stage="llm").inc()
                         raise
+                    self._note_error(provider.name, e)
                     last_error = e
                     continue
             errors_total.labels(stage="llm").inc()
@@ -252,7 +279,7 @@ class LLMRouter:
         last_error: LLMProviderError | None = None
         start = time.monotonic()
         with start_span("llm_router", "llm.stream"):
-            for provider in self._providers:
+            for provider in self._usable_providers():
                 started = False
                 try:
                     async for chunk in provider.stream(
@@ -267,6 +294,7 @@ class LLMRouter:
                     if started or not e.retriable:
                         errors_total.labels(stage="llm").inc()
                         raise
+                    self._note_error(provider.name, e)
                     last_error = e
                     continue
             errors_total.labels(stage="llm").inc()
