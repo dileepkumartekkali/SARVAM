@@ -290,9 +290,15 @@ def _with_forced_context(directive_and_message: str, forced_context: str | None)
         return directive_and_message
     return (
         "[The following was already retrieved from mTouch Labs' real website content — "
-        "use it directly to answer; do not guess or use any other name/fact. This "
-        "reference material is in English — your ANSWER must still be in the user's own "
-        f"detected language below, not English just because the source material is.]\n"
+        "use the FACTS in it directly to answer; do not guess or use any other name/fact. "
+        "This reference material may be written in ANY language, not necessarily English or "
+        "the user's own language — do not assume it matches either. Your ANSWER must be in "
+        "the user's own detected language below regardless of what language this reference "
+        "material happens to be written in: TRANSLATE the retrieved facts (names, numbers, "
+        "descriptions) into the user's own language rather than copying the reference "
+        "material's own wording, script, or language verbatim — including short facts like a "
+        "person's name or title, which must still be transliterated/rendered in the user's own "
+        "script, not pasted as-is from the source.]\n"
         f"{forced_context}\n\n{directive_and_message}"
     )
 
@@ -981,21 +987,42 @@ async def run_turn(
                 )
                 return await (cancellation_token.run(coro) if cancellation_token is not None else coro)
 
-            # Real bug hit live: this call had no exception handling at all
-            # -- unlike the correction-retry's OWN self-check call a few
-            # lines below, which IS wrapped. If every configured provider
-            # fails for this specific call, it used to propagate uncaught
-            # out of run_turn entirely -- which, reached via stream_turn's
-            # tool-call fallback, meant the whole SSE stream died with no
-            # "done" event ever sent: the answer (or tool result) was
-            # already computed, but the turn never completed from the
-            # caller's perspective. Same "inconclusive, not failed" handling
-            # as stream_turn's own guard on its self-check call.
-            try:
-                self_check_ok, self_check_reason = await check(draft)
-            except LLMProviderError:
-                logger.info("turn_trace", extra={"prompt_version": version_id, "self_check_provider_error": True})
-                self_check_ok, self_check_reason = True, "self-check itself failed (provider error) — not evaluated"
+            # Live-confirmed real bug: a RAG-triggered turn ("who is the ceo
+            # of mtouch labs") returned the retrieved chunk's own Telugu
+            # wording VERBATIM regardless of whether the question was asked
+            # in Telugu or plain English -- the model copies a short factual
+            # snippet from tool/forced-context results instead of
+            # translating it. Checked deterministically FIRST (same "cheap
+            # check before an LLM call" pattern _self_check's own word-count/
+            # markdown checks already use) and, if it fires, short-circuits
+            # straight into the SAME correction-retry mechanism below that
+            # already exists for self-check's own LLM-judged violations --
+            # not a second, separate correction path, which would double up
+            # provider calls unpredictably against a mechanism already
+            # proven to work.
+            script_violation = disallowed_script_in(draft) or (
+                "target-language mismatch"
+                if target_language_mismatch(draft, session.response_language, session.is_code_mixed)
+                else None
+            )
+            if script_violation:
+                self_check_ok, self_check_reason = False, f"deterministic violation: {script_violation}"
+            else:
+                # Real bug hit live: this call had no exception handling at all
+                # -- unlike the correction-retry's OWN self-check call a few
+                # lines below, which IS wrapped. If every configured provider
+                # fails for this specific call, it used to propagate uncaught
+                # out of run_turn entirely -- which, reached via stream_turn's
+                # tool-call fallback, meant the whole SSE stream died with no
+                # "done" event ever sent: the answer (or tool result) was
+                # already computed, but the turn never completed from the
+                # caller's perspective. Same "inconclusive, not failed" handling
+                # as stream_turn's own guard on its self-check call.
+                try:
+                    self_check_ok, self_check_reason = await check(draft)
+                except LLMProviderError:
+                    logger.info("turn_trace", extra={"prompt_version": version_id, "self_check_provider_error": True})
+                    self_check_ok, self_check_reason = True, "self-check itself failed (provider error) — not evaluated"
 
             # Detected violations previously had zero effect on the shipped
             # answer — self_check_ok would just come back False while the

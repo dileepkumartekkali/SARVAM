@@ -93,6 +93,33 @@ async def test_run_turn_forces_retrieval_when_message_names_the_company():
     assert "REAL FACT" in str(provider.messages_by_call[0])
 
 
+async def test_run_turn_corrects_a_verbatim_wrong_language_rag_fact():
+    """Regression test for a real live incident: "who is the ceo of mtouch
+    labs" (asked in plain English) came back with the retrieved RAG chunk's
+    own Telugu wording copied VERBATIM, unchanged, regardless of what
+    language the question was asked in. The model quoting a short factual
+    snippet from forced-context/tool results instead of translating it is
+    caught deterministically (target_language_mismatch) and corrected before
+    self-check's own LLM-judgment call, reusing the same correction-retry
+    path as any other self-check violation."""
+    telugu_fact_quoted_verbatim = "ఎం-టచ్ లాబ్స్ సీఈఓ వెంకటేశ్వరరావు పెంటకోట."
+    corrected_english = "The CEO of M-Touch Labs is Venkateswara Rao Pentakota."
+    provider = ScriptedProvider([telugu_fact_quoted_verbatim, corrected_english, "OK"])
+    router = LLMRouter([provider])
+
+    async def fake_search(query: str) -> str:
+        return "[Leadership Team]\nఎం-టచ్ లాబ్స్ సీఈఓ వెంకటేశ్వరరావు పెంటకోట."
+
+    session = _session().model_copy(update={"response_language": "en", "is_code_mixed": False})
+    result = await run_turn(
+        session, router, "who is the ceo of mtouch labs",
+        tools={"search_company_knowledge": fake_search},
+    )
+
+    assert result.text == corrected_english
+    assert result.self_check_ok is True
+
+
 async def test_forced_retrieval_registry_generalizes_to_a_second_topic(monkeypatch):
     """Architecture gap closed: forced retrieval used to be one hardcoded
     keyword+tool pair. _FORCED_RETRIEVAL_REGISTRY is a list of (keyword,
@@ -388,10 +415,17 @@ async def test_voice_mode_gets_a_brevity_directive_text_mode_does_not():
 async def test_self_check_failure_triggers_one_bounded_correction_retry():
     """A detected violation must actually change the shipped answer — not
     just get flagged and ignored (the bug: self_check_ok=False went out
-    unchanged for a mismatched-language reply)."""
+    unchanged for a mismatched-language reply).
+
+    A plain-English draft for a Hindi target is now caught by the
+    deterministic target_language_mismatch check BEFORE the LLM reviewer
+    call — same correction-retry path, but the reviewer call that would
+    have said "VIOLATION: wrong language" is skipped entirely (one fewer
+    wasted provider call for a violation that's already unambiguous without
+    it), so only 3 scripted replies are needed, not 4."""
     violating_draft = "This is a perfectly fine-looking answer in the wrong language."
     corrected_draft = "यह एक सही उत्तर है।"
-    provider = ScriptedProvider([violating_draft, "VIOLATION: wrong language", corrected_draft, "OK"])
+    provider = ScriptedProvider([violating_draft, corrected_draft, "OK"])
     router = LLMRouter([provider])
 
     # Native-script (Devanagari) input, not romanized — keeps this test
@@ -402,8 +436,8 @@ async def test_self_check_failure_triggers_one_bounded_correction_retry():
 
     assert result.text == corrected_draft
     assert result.self_check_ok is True
-    correction_call_messages = provider.messages_by_call[2]
-    assert any("wrong language" in str(m.get("content", "")) for m in correction_call_messages)
+    correction_call_messages = provider.messages_by_call[1]
+    assert any("target-language mismatch" in str(m.get("content", "")) for m in correction_call_messages)
 
 
 async def test_self_check_correction_failure_keeps_original_draft():
