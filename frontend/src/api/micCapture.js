@@ -39,18 +39,24 @@ export class MicCapture {
    * Chrome Android) suspend or reject AudioContext creation in async callbacks
    * because the user-gesture context has already been lost by then.
    * Call `new AudioContext()` directly in your onClick handler and pass it here.
-   * @param {boolean} [relaxedConstraints] - Real bug hit live, recurring:
-   * even `{ideal: true}` (see below) isn't always enough on certain driver
-   * stacks (confirmed live on "Intel Smart Sound Technology for Digital
-   * Microphones" specifically) -- the browser still negotiates a DSP path
-   * through the driver's own hardware audio processing that delivers a
-   * track present in name but literal all-zero samples. Passing `true`
-   * here skips requesting echoCancellation/noiseSuppression/
-   * autoGainControl entirely, so the OS/driver has nothing to negotiate a
-   * DSP path for -- useVoiceSession.js retries with this once, only after
-   * detecting the exact all-zero signature live, not as a first guess.
+   * @param {boolean} [relaxedConstraints] - Confirmed LIVE this did NOT fix
+   * the recurring "Intel Smart Sound Technology for Digital Microphones"
+   * dead-track case: the negotiated track settings still reported
+   * `echoCancellation: true, autoGainControl: true` even with neither
+   * requested. That means this specific driver applies its DSP at the
+   * OS/driver level, beneath what getUserMedia constraints can reach --
+   * kept here since it's still a legitimate (and free) first attempt for
+   * OTHER dead-track cases where the browser itself is responsible, but it
+   * is not assumed to be sufficient alone; see `deviceId` below for the
+   * fallback that actually did something on this driver.
+   * @param {string} [deviceId] - Explicit input device to request, bypassing
+   * whatever the browser picked as its default. The one lever left once
+   * relaxedConstraints is confirmed powerless against driver-level DSP:
+   * switch to a DIFFERENT physical device entirely (e.g. a webcam mic
+   * instead of the laptop's built-in array), since a different device's
+   * driver isn't forcing the same processing.
    */
-  async start(preCreatedContext, relaxedConstraints = false) {
+  async start(preCreatedContext, relaxedConstraints = false, deviceId = null) {
     // `{ideal: true}`, not a bare `true`. A bare boolean is a HARD constraint
     // — reported live: on certain mic/driver stacks (confirmed across two
     // completely different devices/OSes, ruling out one bad mic), Chrome
@@ -60,21 +66,22 @@ export class MicCapture {
     // never rounds to exactly zero, which was the tell). `ideal` lets the
     // browser do its best without ever degrading to a dead track -- but on
     // some driver stacks even that isn't enough (see relaxedConstraints).
-    this._stream = await navigator.mediaDevices.getUserMedia({
-      audio: relaxedConstraints
-        ? { channelCount: 1 }
-        : {
-            channelCount: 1,
-            echoCancellation: { ideal: true },
-            noiseSuppression: { ideal: true },
-            autoGainControl: { ideal: true },
-          },
-    });
+    const audioConstraints = relaxedConstraints
+      ? { channelCount: 1 }
+      : {
+          channelCount: 1,
+          echoCancellation: { ideal: true },
+          noiseSuppression: { ideal: true },
+          autoGainControl: { ideal: true },
+        };
+    if (deviceId) audioConstraints.deviceId = { exact: deviceId };
+    this._stream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
     // Which physical device the browser actually picked — when a mic
     // delivers pure zeros (seen live: rms=0.0000), this label is usually
     // the answer (a virtual/disconnected device was selected).
     const track = this._stream.getAudioTracks()[0];
     this.deviceLabel = track?.label || "unknown device";
+    this.deviceId = track?.getSettings?.().deviceId || null;
     console.info("[voice] using microphone:", this.deviceLabel, relaxedConstraints ? "(relaxed constraints)" : "");
     // Real gap: nothing ever logged what the browser ACTUALLY negotiated --
     // `{ideal: true}` can silently resolve to false (or true, on a driver

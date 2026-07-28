@@ -565,7 +565,13 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
     let consecutiveVoiced = 0;
     let lastLevelLog = 0;
     let deadTrackFrames = 0;
-    let retriedRelaxedConstraints = false;
+    // Two escalating retries, not a boolean: confirmed LIVE that relaxed
+    // constraints alone don't fix every dead-track case (Intel Smart Sound
+    // Technology's driver forces echoCancellation/autoGainControl regardless
+    // of what's requested — negotiated settings after the relaxed retry
+    // still showed both as true). Stage 2 switches to a different physical
+    // device instead, the one thing a different driver isn't also forcing.
+    let retryStage = 0; // 0 = none tried, 1 = relaxed constraints tried, 2 = alternate device tried
 
     const voiceThreshold = () =>
       Math.max(MIN_VOICE_RMS, Math.min(noiseFloor, NOISE_FLOOR_CAP) * NOISE_FLOOR_MULTIPLIER);
@@ -590,13 +596,23 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
 
       if (!voiceDetected && rms < DEAD_TRACK_RMS) {
         deadTrackFrames += 1;
-        if (deadTrackFrames >= DEAD_TRACK_FRAMES_BEFORE_RETRY && !retriedRelaxedConstraints) {
-          retriedRelaxedConstraints = true;
+        if (deadTrackFrames >= DEAD_TRACK_FRAMES_BEFORE_RETRY && retryStage === 0) {
+          retryStage = 1;
+          deadTrackFrames = 0;
           console.warn(
             `[voice] mic producing all-zero samples for ~1s (device: ${mic.deviceLabel}) -- ` +
               "retrying with relaxed (no echo-cancellation/noise-suppression/auto-gain) constraints"
           );
           retryWithRelaxedConstraints();
+          return;
+        }
+        if (deadTrackFrames >= DEAD_TRACK_FRAMES_BEFORE_RETRY && retryStage === 1) {
+          retryStage = 2;
+          console.warn(
+            `[voice] still all-zero after relaxed constraints (device: ${mic.deviceLabel}) -- ` +
+              "the driver is forcing this regardless of what's requested; trying a different input device"
+          );
+          retryWithAlternateDevice();
           return;
         }
       } else {
@@ -642,11 +658,9 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
     // reusing the SAME (already-open) AudioContext -- see
     // MicCapture.stopKeepingContext's own comment on why a brand new
     // context can't be created this deep into an async callback chain on
-    // mobile. Only ever called once per listening session
-    // (retriedRelaxedConstraints guards it) -- a device that's STILL dead
-    // after this genuinely has no signal to give (unplugged, muted at the
-    // OS level), and the existing "I didn't hear anything" message already
-    // suggests checking device selection.
+    // mobile. Only ever called once per listening session (retryStage guards
+    // it) -- if the track is STILL dead after this, retryWithAlternateDevice
+    // takes over as the next escalation.
     const retryWithRelaxedConstraints = async () => {
       const reusableContext = mic.stopKeepingContext();
       mic = new MicCapture(handleFrame);
@@ -659,6 +673,44 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
         addMessage(
           "assistant",
           "Couldn't get a working microphone signal even after retrying. Check that a working microphone is connected and not in use by another app."
+        );
+      }
+    };
+
+    // Last resort once relaxed constraints are confirmed powerless (driver
+    // forces its own DSP regardless of what's requested): switch to a
+    // DIFFERENT physical input device, if one exists. A different device's
+    // driver isn't forcing the same processing on the same track.
+    const retryWithAlternateDevice = async () => {
+      const deadDeviceId = mic.deviceId;
+      let alternate = null;
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        alternate = devices.find((d) => d.kind === "audioinput" && d.deviceId && d.deviceId !== deadDeviceId);
+      } catch (err) {
+        console.error("[voice] could not enumerate audio input devices:", err);
+      }
+      if (!alternate) {
+        stopIdle();
+        addMessage(
+          "assistant",
+          "This microphone isn't producing any signal, even after retrying with relaxed audio settings, and no other input device is available to switch to. " +
+            "This usually means Windows' own microphone \"enhancements\" are forcing audio processing your browser can't override — " +
+            "open Windows Sound settings → Recording → this microphone's Properties → Advanced/Enhancements tab, and disable audio enhancements there, then try again."
+        );
+        return;
+      }
+      const reusableContext = mic.stopKeepingContext();
+      mic = new MicCapture(handleFrame);
+      try {
+        await mic.start(reusableContext, true, alternate.deviceId);
+        micRef.current = mic;
+      } catch (err) {
+        console.error("[voice] alternate-device mic retry failed:", err);
+        stopIdle();
+        addMessage(
+          "assistant",
+          "Couldn't get a working microphone signal even after trying a different input device. Check that a working microphone is connected and not in use by another app."
         );
       }
     };
