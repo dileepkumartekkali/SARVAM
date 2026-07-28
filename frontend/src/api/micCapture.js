@@ -39,8 +39,18 @@ export class MicCapture {
    * Chrome Android) suspend or reject AudioContext creation in async callbacks
    * because the user-gesture context has already been lost by then.
    * Call `new AudioContext()` directly in your onClick handler and pass it here.
+   * @param {boolean} [relaxedConstraints] - Real bug hit live, recurring:
+   * even `{ideal: true}` (see below) isn't always enough on certain driver
+   * stacks (confirmed live on "Intel Smart Sound Technology for Digital
+   * Microphones" specifically) -- the browser still negotiates a DSP path
+   * through the driver's own hardware audio processing that delivers a
+   * track present in name but literal all-zero samples. Passing `true`
+   * here skips requesting echoCancellation/noiseSuppression/
+   * autoGainControl entirely, so the OS/driver has nothing to negotiate a
+   * DSP path for -- useVoiceSession.js retries with this once, only after
+   * detecting the exact all-zero signature live, not as a first guess.
    */
-  async start(preCreatedContext) {
+  async start(preCreatedContext, relaxedConstraints = false) {
     // `{ideal: true}`, not a bare `true`. A bare boolean is a HARD constraint
     // — reported live: on certain mic/driver stacks (confirmed across two
     // completely different devices/OSes, ruling out one bad mic), Chrome
@@ -48,20 +58,31 @@ export class MicCapture {
     // throwing, silently handed back a track present in name but delivering
     // literal all-zero samples (exact 0.0000 RMS — real ambient noise almost
     // never rounds to exactly zero, which was the tell). `ideal` lets the
-    // browser do its best without ever degrading to a dead track.
+    // browser do its best without ever degrading to a dead track -- but on
+    // some driver stacks even that isn't enough (see relaxedConstraints).
     this._stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        channelCount: 1,
-        echoCancellation: { ideal: true },
-        noiseSuppression: { ideal: true },
-        autoGainControl: { ideal: true },
-      },
+      audio: relaxedConstraints
+        ? { channelCount: 1 }
+        : {
+            channelCount: 1,
+            echoCancellation: { ideal: true },
+            noiseSuppression: { ideal: true },
+            autoGainControl: { ideal: true },
+          },
     });
     // Which physical device the browser actually picked — when a mic
     // delivers pure zeros (seen live: rms=0.0000), this label is usually
     // the answer (a virtual/disconnected device was selected).
-    this.deviceLabel = this._stream.getAudioTracks()[0]?.label || "unknown device";
-    console.info("[voice] using microphone:", this.deviceLabel);
+    const track = this._stream.getAudioTracks()[0];
+    this.deviceLabel = track?.label || "unknown device";
+    console.info("[voice] using microphone:", this.deviceLabel, relaxedConstraints ? "(relaxed constraints)" : "");
+    // Real gap: nothing ever logged what the browser ACTUALLY negotiated --
+    // `{ideal: true}` can silently resolve to false (or true, on a driver
+    // that then delivers a dead track anyway) with zero visibility either
+    // way. This is the one log line that would have made the very first
+    // occurrence of the all-zero-RMS bug immediately diagnosable instead of
+    // guessed at.
+    console.info("[voice] negotiated track settings:", track?.getSettings?.());
     // Use the pre-created context (gesture-safe on mobile) or create one now
     // as fallback for desktop where timing is not restricted.
     this._context = preCreatedContext || new AudioContext();
@@ -106,6 +127,30 @@ export class MicCapture {
     this._worklet = null;
     this._sink = null;
     this._pending = [];
+  }
+
+  /** Same teardown as stop(), but leaves the AudioContext open and returns
+   * it — for the dead-track retry in useVoiceSession.js, which needs a NEW
+   * MediaStream (via a fresh getUserMedia call with different constraints)
+   * but must NOT create a brand new AudioContext this deep into an async
+   * frame-processing callback: mobile browsers only allow AudioContext
+   * creation synchronously inside the original click gesture (see start()'s
+   * own preCreatedContext doc) -- by the time frames have been processing
+   * for a second, that gesture window is long gone. */
+  stopKeepingContext() {
+    this._worklet?.port.close();
+    this._worklet?.disconnect();
+    this._sink?.disconnect();
+    this._source?.disconnect();
+    this._stream?.getTracks().forEach((track) => track.stop());
+    const context = this._context;
+    this._stream = null;
+    this._context = null;
+    this._source = null;
+    this._worklet = null;
+    this._sink = null;
+    this._pending = [];
+    return context;
   }
 }
 

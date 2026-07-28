@@ -111,6 +111,23 @@ const NOISE_FLOOR_CAP = 0.01; // floor estimate never exceeds this (speaking-fro
 const NOISE_FLOOR_MULTIPLIER = 4; // voiced = this many times the (capped) measured floor
 const CONSECUTIVE_VOICED_FRAMES_TO_OPEN = 2; // ~64ms — debounces clicks/pops
 
+// Real bug hit live, recurring on certain driver stacks (confirmed on
+// "Intel Smart Sound Technology for Digital Microphones" specifically):
+// even `{ideal: true}` constraints (micCapture.js's own fix for this exact
+// symptom) aren't always enough -- the browser can still negotiate a DSP
+// path through the driver that delivers a track present in name but
+// literal all-zero samples (rms=0.0000 exactly; real ambient noise never
+// rounds to exactly zero). A dead track never crosses ANY voice threshold,
+// so without this, the session just times out with "I didn't hear
+// anything" -- true, but not why, and not self-correcting. This is
+// stricter than MIN_VOICE_RMS specifically to target the exact-zero
+// signature, not just a quiet room.
+const DEAD_TRACK_RMS = 0.0001;
+// ~1 second of frames (32ms each) -- long enough that this isn't a false
+// positive from a genuinely silent room at the very start of listening
+// (MIN_VOICE_RMS's own noise floor is still ramping up during this window).
+const DEAD_TRACK_FRAMES_BEFORE_RETRY = 30;
+
 // Listening can never run unbounded: even if a noisy environment keeps
 // resetting the silence timer, the session concludes here — whatever was
 // transcribed gets finalized and sent rather than hanging forever.
@@ -547,6 +564,8 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
     let noiseFloor = Infinity; // running minimum RMS = this session's silence level
     let consecutiveVoiced = 0;
     let lastLevelLog = 0;
+    let deadTrackFrames = 0;
+    let retriedRelaxedConstraints = false;
 
     const voiceThreshold = () =>
       Math.max(MIN_VOICE_RMS, Math.min(noiseFloor, NOISE_FLOOR_CAP) * NOISE_FLOOR_MULTIPLIER);
@@ -556,9 +575,34 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
       return rms >= voiceThreshold();
     };
 
-    const mic = new MicCapture((frame) => {
+    // Real bug hit live, recurring on certain driver stacks even with the
+    // `{ideal: true}` constraints already in place (see DEAD_TRACK_RMS's own
+    // comment): the browser can still deliver a track that's present in name
+    // but produces literal all-zero samples, forever. Detected here (not in
+    // micCapture.js, which has no concept of "voice" or thresholds) since
+    // this is where per-frame RMS is already being computed; named as its
+    // own function (not inline) so the SAME frame-processing logic can be
+    // reattached to a fresh MicCapture instance on retry, without
+    // duplicating the whole voice-detection closure.
+    const handleFrame = (frame) => {
       if (concluded) return; // silence stop already fired — nothing more leaves the mic
       const rms = frameRMS(frame);
+
+      if (!voiceDetected && rms < DEAD_TRACK_RMS) {
+        deadTrackFrames += 1;
+        if (deadTrackFrames >= DEAD_TRACK_FRAMES_BEFORE_RETRY && !retriedRelaxedConstraints) {
+          retriedRelaxedConstraints = true;
+          console.warn(
+            `[voice] mic producing all-zero samples for ~1s (device: ${mic.deviceLabel}) -- ` +
+              "retrying with relaxed (no echo-cancellation/noise-suppression/auto-gain) constraints"
+          );
+          retryWithRelaxedConstraints();
+          return;
+        }
+      } else {
+        deadTrackFrames = 0;
+      }
+
       const voiced = isVoicedFrame(rms);
 
       // Always-visible field diagnostics (console.info, NOT console.debug —
@@ -592,7 +636,34 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
       } else {
         preRoll.push(frame); // socket still connecting — keep buffering, flushed on open
       }
-    });
+    };
+
+    // Swaps the dead mic for a fresh MicCapture using relaxed constraints,
+    // reusing the SAME (already-open) AudioContext -- see
+    // MicCapture.stopKeepingContext's own comment on why a brand new
+    // context can't be created this deep into an async callback chain on
+    // mobile. Only ever called once per listening session
+    // (retriedRelaxedConstraints guards it) -- a device that's STILL dead
+    // after this genuinely has no signal to give (unplugged, muted at the
+    // OS level), and the existing "I didn't hear anything" message already
+    // suggests checking device selection.
+    const retryWithRelaxedConstraints = async () => {
+      const reusableContext = mic.stopKeepingContext();
+      mic = new MicCapture(handleFrame);
+      try {
+        await mic.start(reusableContext, true);
+        micRef.current = mic;
+      } catch (err) {
+        console.error("[voice] relaxed-constraints mic retry failed:", err);
+        stopIdle();
+        addMessage(
+          "assistant",
+          "Couldn't get a working microphone signal even after retrying. Check that a working microphone is connected and not in use by another app."
+        );
+      }
+    };
+
+    let mic = new MicCapture(handleFrame);
 
     try {
       await mic.start(preCreatedContext);
