@@ -437,7 +437,7 @@ async def test_self_check_failure_triggers_one_bounded_correction_retry():
     assert result.text == corrected_draft
     assert result.self_check_ok is True
     correction_call_messages = provider.messages_by_call[1]
-    assert any("target-language mismatch" in str(m.get("content", "")) for m in correction_call_messages)
+    assert any("Hindi" in str(m.get("content", "")) for m in correction_call_messages)
 
 
 async def test_self_check_correction_failure_keeps_original_draft():

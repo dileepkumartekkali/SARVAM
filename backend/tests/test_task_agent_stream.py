@@ -502,6 +502,14 @@ async def test_stream_turn_catches_wrong_indic_language_before_it_reaches_the_cl
     assert "డేటా" not in combined
     assert "corrected English reply" in combined
     assert provider.call_count == 3
+    # Real bug hit live, in production, AFTER this guard first shipped: the
+    # correction call used to just re-ask the SAME messages blind, hoping a
+    # fresh sample would differ -- confirmed live it does NOT reliably
+    # differ for a systematic cause (quoting a RAG fact verbatim), so the
+    # correction call must give the model explicit feedback about what was
+    # wrong, same technique run_turn's own correction-retry already uses.
+    correction_call_messages = provider.messages_by_call[1]
+    assert any("English" in str(m.get("content", "")) for m in correction_call_messages)
 
 
 async def test_stream_turn_catches_disallowed_script_before_it_reaches_the_client():

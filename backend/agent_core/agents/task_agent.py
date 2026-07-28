@@ -208,6 +208,22 @@ def _turn_directive(session: SessionState, user_message: str) -> str:
     return " ".join(d for d in (_language_directive(session, user_message), _voice_brevity_directive(session)) if d)
 
 
+def _describe_script_violation(script_violation: str, session: SessionState) -> str:
+    """Human-actionable wording for a disallowed_script_in/
+    target_language_mismatch hit, used as the `{reason}` fed into
+    _CORRECTION_REQUEST_TEMPLATE — shared by stream_turn and run_turn so
+    both give the model the same explicit, concrete feedback rather than a
+    cryptic internal label."""
+    target_name = (
+        LANGUAGE_NAMES.get(session.response_language, session.response_language)
+        if session.response_language
+        else "the target language"
+    )
+    if script_violation == "target-language mismatch":
+        return f"the draft was not in {target_name} (the target language) — wrong language/script entirely"
+    return f"the draft used {script_violation} script, which no supported language ever uses"
+
+
 # Real bug hit live, repeatedly, after every prompt-level fix already tried
 # here (tool description rewrite, history-verification marker): whether the
 # model chooses to call a retrieval tool AT ALL is model judgment, not a
@@ -701,8 +717,30 @@ async def stream_turn(
                     "disallowed_script_detected": script_violation,
                 },
             )
+            # Real bug hit live: the first version of this correction just
+            # re-asked the SAME messages, hoping a fresh independent sample
+            # would land differently -- confirmed live it does NOT reliably
+            # differ when the cause is systematic (the model quoting a
+            # forced-context RAG fact verbatim), not a one-off fluke: the
+            # regenerated draft came back in Telugu AGAIN (turn_trace:
+            # "VIOLATION: response is in Telugu, not the target language
+            # English", right after this same guard had already fired once).
+            # Telling the model explicitly what it got wrong -- the same
+            # technique run_turn's own correction-retry already uses
+            # successfully -- is a fundamentally stronger prompt than a
+            # blind re-roll.
+            correction_messages = [
+                *messages,
+                {"role": "assistant", "content": "".join(accumulated)},
+                {
+                    "role": "user",
+                    "content": _CORRECTION_REQUEST_TEMPLATE.format(
+                        reason=_describe_script_violation(script_violation, session)
+                    ),
+                },
+            ]
             try:
-                corrected = await router.complete_with_fallback(messages, system=system_prompt)
+                corrected = await router.complete_with_fallback(correction_messages, system=system_prompt)
             except LLMProviderError:
                 corrected = LLM_UNAVAILABLE_APOLOGY
             accumulated = [corrected]
@@ -1006,7 +1044,7 @@ async def run_turn(
                 else None
             )
             if script_violation:
-                self_check_ok, self_check_reason = False, f"deterministic violation: {script_violation}"
+                self_check_ok, self_check_reason = False, _describe_script_violation(script_violation, session)
             else:
                 # Real bug hit live: this call had no exception handling at all
                 # -- unlike the correction-retry's OWN self-check call a few
