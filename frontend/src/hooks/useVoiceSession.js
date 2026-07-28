@@ -545,6 +545,22 @@ export function useVoiceSession({ token, ids, onUnauthorized }) {
             }
             return;
           }
+          // Real gap closed: the gateway now rejects a low-confidence final
+          // transcript before it ever reaches here (is_low_confidence_transcript,
+          // wired into /ws/stt) instead of forwarding it as a normal
+          // "transcript" event -- a mistranscription (e.g. an unfamiliar
+          // proper noun picked up as the wrong language) used to sail
+          // straight through and drive a full, wrong-language LLM turn with
+          // no chance to catch it. Shown directly as a local clarifying
+          // question, same as the existing "I didn't catch that" case --
+          // never sent to sendMessage/the LLM, since there's no real
+          // transcript to answer.
+          if (event.type === "low_confidence") {
+            clearTimeout(graceTimerRef.current);
+            stopIdle();
+            addMessage("assistant", event.text || "Sorry, could you say that again?");
+            return;
+          }
           // VAD speech_end is deliberately NOT a stop signal anymore — it
           // fires on brief mid-sentence pauses too. The 3s silence timer
           // (fed by local frame energy) is the only thing that ends a turn.

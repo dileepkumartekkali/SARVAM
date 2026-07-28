@@ -104,6 +104,48 @@ def test_stt_ws_streams_transcript_events_for_valid_frames():
         gateway_app.dependency_overrides.clear()
 
 
+def test_stt_ws_sends_a_clarifying_question_for_a_low_confidence_transcript():
+    """Real gap closed: is_low_confidence_transcript already existed and was
+    wired into converse_ws, but never connected to /ws/stt -- the endpoint
+    the frontend actually uses for every voice-input mode (both STT-only
+    and full speech-to-speech, confirmed live neither ever calls
+    /ws/converse). Every final transcript reached the client and drove a
+    full LLM turn regardless of how unsure Sarvam itself was -- a
+    low-confidence mistranscription (e.g. an unfamiliar proper noun picked
+    up as the wrong language) had no safety net at all on the path that
+    matters."""
+    fake = FakeGatewaySTT(
+        events_per_frame=[[{"type": "transcript", "text": "garbled maybe telugu", "is_final": True, "confidence": 0.2}]]
+    )
+    gateway_app.dependency_overrides[get_stt_client] = lambda: fake
+    try:
+        client = TestClient(gateway_app)
+        with client.websocket_connect("/ws/stt") as ws:
+            ws.send_text(json.dumps({"codec": "pcm_s16le", "sample_rate": 16000}))
+            ws.send_bytes(_valid_frame())
+            event = ws.receive_json()
+        assert event["type"] == "low_confidence"
+    finally:
+        gateway_app.dependency_overrides.clear()
+
+
+def test_stt_ws_forwards_a_high_confidence_transcript_unchanged():
+    fake = FakeGatewaySTT(
+        events_per_frame=[[{"type": "transcript", "text": "hello", "is_final": True, "confidence": 0.95}]]
+    )
+    gateway_app.dependency_overrides[get_stt_client] = lambda: fake
+    try:
+        client = TestClient(gateway_app)
+        with client.websocket_connect("/ws/stt") as ws:
+            ws.send_text(json.dumps({"codec": "pcm_s16le", "sample_rate": 16000}))
+            ws.send_bytes(_valid_frame())
+            event = ws.receive_json()
+        assert event["type"] == "transcript"
+        assert event["text"] == "hello"
+    finally:
+        gateway_app.dependency_overrides.clear()
+
+
 def test_stt_ws_rejects_malformed_frame_without_forwarding_it():
     fake = FakeGatewaySTT(events_per_frame=[[]])
     gateway_app.dependency_overrides[get_stt_client] = lambda: fake

@@ -274,9 +274,30 @@ async def stt_ws(websocket: WebSocket, stt_client: SpeechSTTClient = Depends(get
                 if event.get("type") == "transcript" and event.get("text"):
                     # PII-masked before it ever hits a log line — never log the raw transcript.
                     logger.debug("transcript event: %s", mask_pii(event["text"]))
+                if event.get("type") == "transcript" and event.get("is_final"):
+                    # Confidence alone, never the transcript text -- PII-safe,
+                    # and the one thing needed to tell "our code answered
+                    # wrong" apart from "Sarvam itself mis-transcribed the
+                    # speech" from Render logs alone, without reproducing live.
+                    logger.info("stt_ws final transcript confidence=%s", event.get("confidence"))
                 if event.get("type") == "error":
                     errors_total.labels(stage="stt").inc()
                     logger.warning("stt_ws error event forwarded to client: %s", event.get("reason"))
+                # Real gap: is_low_confidence_transcript already exists and is
+                # wired into converse_ws (S2S plan), but was never connected
+                # to THIS endpoint -- the one the frontend actually uses for
+                # every voice-input mode (STT-only and full speech-to-speech
+                # alike). Every final transcript reached the client and drove
+                # a full LLM turn regardless of how unsure Sarvam itself was,
+                # even an empty/near-empty one -- a low-confidence
+                # mistranscription (e.g. an unfamiliar proper noun picked up
+                # as a different language) had no safety net at all. Reusing
+                # the same, already-tested threshold check rather than
+                # guessing at a new one.
+                if is_low_confidence_transcript(event):
+                    errors_total.labels(stage="stt_low_confidence").inc()
+                    await websocket.send_json({"type": "low_confidence", "text": LOW_CONFIDENCE_TRANSCRIPT_QUESTION})
+                    continue
                 try:
                     await websocket.send_json(event)
                 except RuntimeError:
