@@ -75,6 +75,13 @@ async def test_stream_translates_real_sarvam_events_and_sends_config_via_url_and
     audio_messages = [json.loads(m) for m in ws.sent]
     assert audio_messages[0]["audio"]["data"] == base64.b64encode(b"\x00\x01" * 512).decode()
     assert audio_messages[0]["audio"]["sample_rate"] == "16000"
+    # Regression test for a real live rejection: a prior "fix" set this field
+    # to the real codec ("pcm_s16le"), which Sarvam rejected outright --
+    # "Error in Pipeline : 1 validation error for SarvamAppRequest
+    # audio.encoding Input should be 'audio/wav' [type=enum, ...]". This
+    # field is a fixed protocol constant, not a real per-message codec label
+    # -- Sarvam already gets the real codec from input_audio_codec in the URL.
+    assert audio_messages[0]["audio"]["encoding"] == "audio/wav"
 
 
 async def test_error_event_is_translated():

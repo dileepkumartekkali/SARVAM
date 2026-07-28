@@ -117,7 +117,7 @@ class SarvamSTTClient:
 
         try:
             async with self._connect(url, additional_headers={"Api-Subscription-Key": self._api_key()}) as ws:
-                send_task = asyncio.ensure_future(self._pump_audio(ws, audio, sample_rate, codec))
+                send_task = asyncio.ensure_future(self._pump_audio(ws, audio, sample_rate))
                 try:
                     # A plain `async for raw in ws` here waited on Sarvam's
                     # socket INDEFINITELY after the audio source ended —
@@ -201,19 +201,23 @@ class SarvamSTTClient:
         return None
 
     @staticmethod
-    async def _pump_audio(ws, audio: AsyncIterator[bytes], sample_rate: int, codec: str) -> None:
+    async def _pump_audio(ws, audio: AsyncIterator[bytes], sample_rate: int) -> None:
         async for chunk in audio:
             payload = {
                 "audio": {
                     "data": base64.b64encode(chunk).decode("ascii"),
                     "sample_rate": str(sample_rate),
-                    # Real gap: this was hardcoded to "audio/wav" regardless
-                    # of the codec actually negotiated in the connection URL
-                    # (input_audio_codec=codec, above) -- raw PCM frames were
-                    # labeled as WAV on every message. Using the real codec
-                    # keeps the per-frame label consistent with what the
-                    # connection itself declared.
-                    "encoding": codec,
+                    # This was previously set to the real codec ("pcm_s16le")
+                    # on the theory that the per-frame label should match
+                    # what the connection actually negotiated. Proven WRONG
+                    # by a live Sarvam rejection: `SarvamAppRequest.audio.
+                    # encoding` is a strict enum that only accepts the
+                    # literal "audio/wav" -- it is not a real per-message
+                    # codec declaration, just a fixed protocol constant.
+                    # Sarvam already knows the real wire codec from
+                    # `input_audio_codec` in the connection URL (above); this
+                    # field must stay hardcoded regardless of what `codec` is.
+                    "encoding": "audio/wav",
                 }
             }
             await ws.send(json.dumps(payload))
