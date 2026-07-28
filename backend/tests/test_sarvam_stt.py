@@ -6,7 +6,8 @@ import pytest
 import websockets.exceptions
 
 import agent_core.speech.sarvam_stt as sarvam_stt_module
-from agent_core.speech.sarvam_stt import SarvamSTTClient, SpeechStreamError
+from agent_core.speech.audio_validation import validate_wav
+from agent_core.speech.sarvam_stt import SarvamSTTClient, SpeechStreamError, _pcm16_to_wav
 from agent_core.speech.clients import STTMode
 
 from ._fake_ws import FakeWSConnection, fake_connect_returning
@@ -176,6 +177,36 @@ async def test_transcribe_rest_posts_audio_and_returns_json(monkeypatch):
     result = await client.transcribe_rest(b"\x00\x00\x00\x00")
 
     assert result == {"type": "transcript", "text": "fallback transcript", "is_final": True, "confidence": 0.7}
+
+
+def test_pcm16_to_wav_produces_a_real_wav_file():
+    """Regression test for a real live incident: transcribe_rest used to
+    upload raw PCM bytes labeled "audio.wav" without ever building an
+    actual WAV header -- Sarvam correctly rejected it EVERY time with
+    "Failed to read the file, please check the audio format," since raw
+    PCM is not a valid WAV file no matter what it's named/labeled. This
+    silently guaranteed the REST fallback (the whole point of the
+    retry-then-rest-fallback path) could never work, dropping the
+    utterance whenever the streaming path had any hiccup at all."""
+    pcm = b"\x00\x01" * 512
+    wav = _pcm16_to_wav(pcm, sample_rate=16000)
+    assert validate_wav(wav).ok is True
+    assert wav.endswith(pcm)  # original audio bytes preserved, just wrapped in a real header
+
+
+async def test_transcribe_rest_uploads_a_real_wav_file(monkeypatch):
+    monkeypatch.setenv("SARVAM_API_KEY", "test-key")
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = request.read()
+        return httpx.Response(200, json={"transcript": "ok"})
+
+    client = SarvamSTTClient(http_transport=httpx.MockTransport(handler))
+
+    await client.transcribe_rest(b"\x00\x01" * 512, sample_rate=16000)
+
+    assert b"RIFF" in captured["body"] and b"WAVE" in captured["body"]
 
 
 async def test_transcribe_rest_error_raises_speech_stream_error(monkeypatch):

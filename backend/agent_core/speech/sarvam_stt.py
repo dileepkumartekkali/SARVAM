@@ -65,6 +65,31 @@ class SpeechStreamError(Exception):
     whether to retry, fall back to REST, or surface the failure."""
 
 
+def _pcm16_to_wav(pcm: bytes, *, sample_rate: int, channels: int = 1) -> bytes:
+    """Wraps raw PCM16LE bytes in a minimal (44-byte header) WAV container.
+    The client's mic capture and this module's own `validate_pcm_frame`
+    only ever produce/accept raw PCM16LE frames — never a real WAV file —
+    so anything uploading this audio as "a WAV file" must build a real
+    header itself; a filename/content-type claim alone doesn't make raw
+    PCM bytes valid WAV data."""
+    bits_per_sample = 16
+    byte_rate = sample_rate * channels * bits_per_sample // 8
+    block_align = channels * bits_per_sample // 8
+    data_size = len(pcm)
+    header = (
+        b"RIFF" + (36 + data_size).to_bytes(4, "little") + b"WAVE"
+        b"fmt " + (16).to_bytes(4, "little")
+        + (1).to_bytes(2, "little")  # PCM format
+        + channels.to_bytes(2, "little")
+        + sample_rate.to_bytes(4, "little")
+        + byte_rate.to_bytes(4, "little")
+        + block_align.to_bytes(2, "little")
+        + bits_per_sample.to_bytes(2, "little")
+        + b"data" + data_size.to_bytes(4, "little")
+    )
+    return header + pcm
+
+
 class SarvamSTTClient:
     def __init__(
         self,
@@ -246,14 +271,28 @@ class SarvamSTTClient:
             }
             await ws.send(json.dumps(payload))
 
-    async def transcribe_rest(self, audio: bytes, *, mode: STTMode = STTMode.CODEMIX) -> STTEvent:
+    async def transcribe_rest(
+        self, audio: bytes, *, mode: STTMode = STTMode.CODEMIX, sample_rate: int = 16000
+    ) -> STTEvent:
         headers = {"Api-Subscription-Key": self._api_key()}
         async with httpx.AsyncClient(timeout=self._timeout, transport=self._http_transport) as client:
             resp = await client.post(
                 self._rest_url,
                 headers=headers,
                 data={"mode": mode.value},
-                files={"file": ("audio.wav", audio, "audio/wav")},
+                # Real bug hit live: `audio` here is raw PCM16LE (the same
+                # validated frames the streaming path sends, concatenated) --
+                # this used to upload it labeled "audio.wav"/"audio/wav"
+                # WITHOUT ever wrapping it in an actual WAV container. Raw
+                # PCM bytes are not a valid WAV file no matter what the
+                # filename/content-type claim -- confirmed live, this failed
+                # EVERY time with "Failed to read the file, please check the
+                # audio format," meaning the fallback this whole retry path
+                # exists for was silently guaranteed to never work,
+                # dropping the utterance whenever the streaming path had any
+                # hiccup at all. A real RIFF/WAVE header makes it an
+                # actually-valid file.
+                files={"file": ("audio.wav", _pcm16_to_wav(audio, sample_rate=sample_rate), "audio/wav")},
             )
             if resp.status_code != 200:
                 raise SpeechStreamError(f"STT REST returned {resp.status_code}: {resp.text}")

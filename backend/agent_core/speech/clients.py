@@ -68,7 +68,9 @@ class SpeechSTTClient(Protocol):
         """
         ...
 
-    async def transcribe_rest(self, audio: bytes, *, mode: STTMode = STTMode.CODEMIX) -> STTEvent:
+    async def transcribe_rest(
+        self, audio: bytes, *, mode: STTMode = STTMode.CODEMIX, sample_rate: int = 16000
+    ) -> STTEvent:
         """Sync REST transcription for short clips (< 30s)."""
         ...
 

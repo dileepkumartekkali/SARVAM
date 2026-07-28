@@ -39,7 +39,9 @@ class LoadTestFakeSTT:
             if frame_count == 3:
                 yield {"type": "transcript", "text": "load test transcript", "is_final": True, "confidence": 0.95}
 
-    async def transcribe_rest(self, audio: bytes, *, mode: STTMode = STTMode.CODEMIX) -> STTEvent:
+    async def transcribe_rest(
+        self, audio: bytes, *, mode: STTMode = STTMode.CODEMIX, sample_rate: int = 16000
+    ) -> STTEvent:
         return {"text": "load test rest transcript"}
 
     async def transcribe_batch(self, audio_uri: str, *, mode: STTMode = STTMode.CODEMIX) -> str:

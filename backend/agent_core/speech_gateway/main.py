@@ -258,7 +258,7 @@ async def stt_ws(websocket: WebSocket, stt_client: SpeechSTTClient = Depends(get
         return stt_client.stream(audio_gen, codec=codec, sample_rate=sample_rate, mode=mode)
 
     async def rest_fallback():
-        return await stt_client.transcribe_rest(b"".join(audio_buffer), mode=mode)
+        return await stt_client.transcribe_rest(b"".join(audio_buffer), mode=mode, sample_rate=sample_rate)
 
     def on_retry():
         reconnects_total.labels(stage="stt").inc()

@@ -69,7 +69,7 @@ class FailingGatewaySTT:
         raise SpeechStreamError("simulated drop")
         yield  # pragma: no cover — unreachable, satisfies async generator shape
 
-    async def transcribe_rest(self, audio, *, mode=STTMode.CODEMIX):
+    async def transcribe_rest(self, audio, *, mode=STTMode.CODEMIX, sample_rate=16000):
         self.rest_calls.append(audio)
         return {"text": "recovered via rest"}
 
